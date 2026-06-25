@@ -1,0 +1,531 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.dim {
+  color: var(--dim);
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.bar button {
+  background: var(--btn-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 14px;
+  cursor: pointer;
+}
+
+.bar button:hover {
+  background: var(--hover);
+}
+
+.error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.theme-select {
+  margin-left: auto;
+  background: var(--btn-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 8px;
+  cursor: pointer;
+  outline: none;
+}
+
+.follow.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Hamburger toggle + drawer backdrop: only used on narrow screens. */
+.navtoggle {
+  display: none;
+  font-size: 16px;
+  line-height: 1;
+  padding: 5px 10px;
+}
+
+.backdrop {
+  display: none;
+}
+
+/* Connection screen */
+.connect {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.connect-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(340px, 92vw);
+  box-sizing: border-box;
+  padding: 28px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.connect-title {
+  margin: 0;
+  text-align: center;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.connect-sub {
+  margin: -6px 0 6px;
+  text-align: center;
+  font-size: 13px;
+}
+
+.connect-row {
+  display: flex;
+  gap: 10px;
+}
+
+.connect-card input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  outline: none;
+  width: 100%;
+}
+
+.connect-card input:focus {
+  border-color: var(--accent);
+}
+
+.connect-card input.grow {
+  flex: 1;
+}
+
+.connect-card input.port {
+  width: 90px;
+  flex: none;
+}
+
+.connect-card button {
+  margin-top: 4px;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: var(--bg);
+  font-weight: 600;
+  padding: 9px 14px;
+  cursor: pointer;
+}
+
+.connect-card button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.connect-error {
+  color: var(--error-fg);
+  font-size: 13px;
+  text-align: center;
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.sidebar {
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--line);
+  min-height: 0;
+}
+
+.filter {
+  margin: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  outline: none;
+}
+
+.list {
+  overflow-y: auto;
+  flex: 1;
+}
+
+.row {
+  height: 22px;
+  line-height: 22px;
+  padding: 0 10px;
+  box-sizing: border-box;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row:hover {
+  background: var(--hover);
+}
+
+.row.active {
+  background: var(--active);
+}
+
+.content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.placeholder {
+  margin: auto;
+  color: var(--dim);
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.subbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.subbar input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 8px;
+  width: 200px;
+  outline: none;
+}
+
+.subbar input.grow {
+  flex: 1;
+  width: auto;
+}
+
+.subbar button {
+  background: var(--btn-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 14px;
+  cursor: pointer;
+}
+
+.tabs button {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--dim);
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.tabs button.on {
+  color: var(--text);
+  background: var(--active);
+}
+
+.tabs button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.view {
+  flex: 1;
+  overflow: auto;
+  padding: 10px 14px;
+  min-height: 0;
+  background: var(--code-bg, var(--bg));
+}
+
+.codeline {
+  white-space: pre;
+  line-height: 1.5;
+}
+
+.codeline.flash {
+  border-radius: 4px;
+  animation: flash-line 1.3s ease-out;
+}
+
+@keyframes flash-line {
+  0% {
+    background: rgba(155, 184, 232, 0.5);
+  }
+  60% {
+    background: rgba(155, 184, 232, 0.28);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+.graphwrap {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+  background: var(--bg);
+}
+
+.graph {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none; /* let us handle one-finger pan instead of page scroll */
+}
+
+.graph:active {
+  cursor: grabbing;
+}
+
+.graphzoom {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.graphzoom button {
+  width: 34px;
+  height: 34px;
+  font-size: 20px;
+  line-height: 1;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.graphzoom button:hover {
+  background: var(--active);
+}
+
+.gnode {
+  fill: var(--panel);
+  stroke: var(--line);
+  stroke-width: 1px;
+}
+
+.gtext {
+  font-size: 12.5px;
+}
+
+/* SVG text colours come from fill; map each token's `color` onto its fill so
+   the .tok-* palette (shared with the HTML tabs) applies here too. */
+.gtext,
+.graph tspan {
+  fill: currentColor;
+}
+
+.ref {
+  cursor: pointer;
+}
+
+.ref:hover {
+  text-decoration: underline;
+}
+
+.edit {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  margin-left: 6px;
+  padding: 0 2px;
+  font-size: 13px;
+}
+
+.addr-edit {
+  cursor: pointer;
+}
+
+.addr-edit:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* Token colours come from CSS variables; the active theme class on .app
+   (.syntax-dark / .syntax-darcula) supplies the palette, mirroring IDA's
+   CustomIDAMemo line-fg-* values. */
+.tok-default { color: var(--tok-default); }
+.tok-insn { color: var(--tok-insn); }
+.tok-reg { color: var(--tok-reg); }
+.tok-num { color: var(--tok-num); }
+.tok-str,
+.tok-char { color: var(--tok-str); }
+.tok-locvar { color: var(--tok-locvar); }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-codename { color: var(--tok-codename); }
+.tok-dataname { color: var(--tok-dataname); }
+.tok-cref { color: var(--tok-cref); }
+.tok-dref { color: var(--tok-dref); }
+.tok-impname { color: var(--tok-impname); }
+.tok-libname { color: var(--tok-libname); }
+.tok-segname { color: var(--tok-segname); }
+.tok-symbol,
+.tok-prefix { color: var(--tok-symbol); }
+.tok-voidop { color: var(--tok-voidop); }
+.tok-comment { color: var(--tok-comment); }
+.tok-error { color: var(--tok-error); }
+
+.dtable {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.dthead {
+  display: grid;
+  gap: 0 12px;
+  padding: 6px 14px;
+  color: var(--dim);
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.dtbody {
+  flex: 1;
+}
+
+.dtrow {
+  display: grid;
+  gap: 0 12px;
+  height: 24px;
+  align-items: center;
+  padding: 0 14px;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--line);
+}
+
+.dtrow > div {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dtrow.clickable {
+  cursor: pointer;
+}
+
+.dtrow:hover {
+  background: var(--hover);
+}
+
+.dtrow.active {
+  background: var(--active);
+}
+
+.xrefs {
+  border-top: 1px solid var(--line);
+  padding: 8px 14px;
+  max-height: 30%;
+  overflow: auto;
+}
+
+.xref {
+  line-height: 1.5;
+}
+
+/* --- Mobile / tablet ----------------------------------------------------- */
+@media (max-width: 760px) {
+  .navtoggle {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* The bar wraps and drops the verbose file info to save width. */
+  .bar {
+    flex-wrap: wrap;
+    gap: 6px 8px;
+  }
+
+  .bar .info {
+    display: none;
+  }
+
+  /* Function list becomes a slide-over drawer over the content. */
+  .sidebar {
+    position: absolute;
+    z-index: 30;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(80%, 300px);
+    background: var(--panel);
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    box-shadow: 2px 0 16px rgba(0, 0, 0, 0.5);
+  }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  .backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    background: rgba(0, 0, 0, 0.45);
+  }
+
+  /* Roomier tap targets for touch (row heights stay fixed — the virtualizer
+     positions rows by a constant height, so they can't change per breakpoint). */
+  .tabs button {
+    padding: 6px 12px;
+  }
+
+  .xrefs {
+    max-height: 40%;
+  }
+}

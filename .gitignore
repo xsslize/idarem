@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Editor
+.vscode/
+.idea/
