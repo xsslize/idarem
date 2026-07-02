@@ -18,10 +18,12 @@ export interface FunctionEntry {
   size: number;
 }
 
-// One colored span of a code line: text plus an IDA color category.
+// One colored span of a code line: text plus an IDA color category. In
+// pseudocode, `lv` is set to the local-variable name when the token is one.
 export interface Token {
   t: string;
   c: string;
+  lv?: string;
 }
 
 export interface DisasmLine {
@@ -119,6 +121,14 @@ export interface LocalTypesResult {
   error?: string;
 }
 
+export type SearchKind = "address" | "function" | "string" | "name";
+
+export interface SearchResult {
+  kind: SearchKind;
+  ea: Ea;
+  label: string;
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token: string;
@@ -183,6 +193,9 @@ export class ApiClient {
   localTypes() {
     return this.get<LocalTypesResult>("/api/local-types");
   }
+  search(query: string, limit = 60) {
+    return this.get<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+  }
   // EventSource can't send headers, so the token rides as a query param.
   eventsUrl() {
     const q = this.token ? `?token=${encodeURIComponent(this.token)}` : "";
@@ -198,6 +211,9 @@ export class ApiClient {
   }
   comment(ea: Ea, text: string) {
     return this.post<{ ok: boolean }>("/api/comment", { ea, text });
+  }
+  renameLvar(ea: Ea, old: string, name: string) {
+    return this.post<{ ok: boolean }>("/api/rename-lvar", { ea, old, new: name });
   }
 }
 

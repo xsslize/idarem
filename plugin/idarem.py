@@ -132,6 +132,82 @@ def parse_tagged(line):
     except Exception:
         return [{"t": ida_lines.tag_remove(line), "c": "default"}]
 
+def _anchor_lvar_name(cfunc, piece):
+    # A COLOR_ADDR anchor points at a ctree item; if that item is a variable
+    # expression (cot_var), return the local variable's name. This is how IDA
+    # itself decides what's a renameable variable under the cursor.
+    try:
+        anchor = ida_hexrays.ctree_anchor_t()
+        anchor.value = int(piece, 16)
+        if not anchor.is_citem_anchor():
+            return None
+        idx = anchor.get_index()
+        if not (0 <= idx < len(cfunc.treeitems)):
+            return None
+        item = cfunc.treeitems[idx]
+        if item.is_expr() and item.op == ida_hexrays.cot_var:
+            vidx = item.cexpr.v.idx
+            if 0 <= vidx < cfunc.lvars.size():
+                return cfunc.lvars[vidx].name or None
+    except Exception:
+        pass
+    return None
+
+def _parse_pseudocode(line, cfunc):
+    # Like _parse_tagged, but resolves COLOR_ADDR anchors to ctree items so tokens
+    # that are local variables get tagged with their name ("lv") for renaming.
+    tokens = []
+    stack = ["default"]
+    buffer = []
+    current_lvar = [None]
+
+    def flush():
+        if buffer:
+            token = {"t": "".join(buffer), "c": stack[-1]}
+            if current_lvar[0]:
+                token["lv"] = current_lvar[0]
+            tokens.append(token)
+            buffer.clear()
+
+    index = 0
+    length = len(line)
+    while index < length:
+        char = line[index]
+        if char == _SCOLOR_ON:
+            flush()
+            index += 1
+            tag = line[index] if index < length else ""
+            index += 1
+            if tag == _SCOLOR_ADDR:
+                piece = line[index:index + _ADDR_SIZE]
+                index += _ADDR_SIZE
+                current_lvar[0] = _anchor_lvar_name(cfunc, piece)
+            else:
+                stack.append(_COLOR_MAP.get(ord(tag), "default") if tag else "default")
+        elif char == _SCOLOR_OFF:
+            flush()
+            index += 2
+            if len(stack) > 1:
+                stack.pop()
+        elif char == _SCOLOR_ESC:
+            index += 1
+            if index < length:
+                buffer.append(line[index])
+                index += 1
+        elif char == _SCOLOR_INV:
+            index += 1
+        else:
+            buffer.append(char)
+            index += 1
+    flush()
+    return tokens
+
+def parse_pseudocode(line, cfunc):
+    try:
+        return _parse_pseudocode(line, cfunc)
+    except Exception:
+        return parse_tagged(line)
+
 def hexea(ea):
     return "0x%X" % (ea & 0xFFFFFFFFFFFFFFFF)
 
@@ -168,20 +244,41 @@ def _build_view_map():
 
 _VIEW_MAP = _build_view_map()
 
-_TITLE_HINTS = [("local types", "types")]
+# Fallback matching by window title, since some windows' BWN_* constant varies by
+# IDA version (Local Types in particular). IDA titles windows predictably.
+_TITLE_HINTS = [
+    ("types layout", "types"),  # IDA 9.x titles the Local Types window "Types Layout"
+    ("local type", "types"),
+    ("pseudocode", "pseudo"),
+    ("ida view", "disasm"),
+    ("hex view", "hex"),
+    ("strings", "strings"),
+    ("imports", "imports"),
+    ("exports", "exports"),
+    ("names", "names"),
+    ("segments", "segments"),
+]
+
+_unmapped_widgets = set()
 
 def _widget_view(widget):
     if widget is None:
         return None
     try:
-        view = _VIEW_MAP.get(ida_kernwin.get_widget_type(widget))
+        wtype = ida_kernwin.get_widget_type(widget)
+        view = _VIEW_MAP.get(wtype)
         if view:
             return view
-        # Fallback by window title for types whose BWN_* constant varies by version.
-        title = (ida_kernwin.get_widget_title(widget) or "").lower()
+        title = ida_kernwin.get_widget_title(widget) or ""
+        low = title.lower()
         for hint, mapped in _TITLE_HINTS:
-            if hint in title:
+            if hint in low:
                 return mapped
+        # Log each unknown window once so it can be identified and mapped.
+        key = (wtype, title)
+        if key not in _unmapped_widgets:
+            _unmapped_widgets.add(key)
+            print("[idarem] unmapped widget: type=%s title=%r" % (wtype, title))
     except Exception:
         return None
     return None
@@ -284,7 +381,7 @@ def query_pseudocode(ea):
     decompiled = ida_hexrays.decompile(func.start_ea)
     if decompiled is None:
         return None
-    lines = [{"tokens": parse_tagged(item.line)} for item in decompiled.get_pseudocode()]
+    lines = [{"tokens": parse_pseudocode(item.line, decompiled)} for item in decompiled.get_pseudocode()]
     return {"ea": hexea(func.start_ea), "name": ida_funcs.get_func_name(func.start_ea), "lines": lines}
 
 def query_xrefs(ea):
@@ -377,6 +474,53 @@ def query_local_types():
         return {"error": str(error), "items": []}
     return {"items": items}
 
+def query_search(query, limit):
+    query = (query or "").strip()
+    if not query:
+        return []
+    low = query.lower()
+    per = max(5, limit // 4)  # keep each category's share balanced
+    results = []
+
+    def add(kind, ea, label):
+        results.append({"kind": kind, "ea": hexea(ea), "label": label})
+
+    # Exact hex address, if the query parses as one and is mapped.
+    try:
+        addr = int(query, 16)
+        if ida_bytes.is_loaded(addr):
+            add("address", addr, ida_funcs.get_func_name(addr) or ida_name.get_name(addr) or hexea(addr))
+    except Exception:
+        pass
+
+    count = 0
+    for start_ea in idautils.Functions():
+        name = ida_funcs.get_func_name(start_ea) or ""
+        if low in name.lower():
+            add("function", start_ea, name)
+            count += 1
+            if count >= per:
+                break
+
+    count = 0
+    for string_item in idautils.Strings():
+        text = str(string_item)
+        if low in text.lower():
+            add("string", string_item.ea, text[:120])
+            count += 1
+            if count >= per:
+                break
+
+    count = 0
+    for ea, name in idautils.Names():
+        if low in name.lower():
+            add("name", ea, name)
+            count += 1
+            if count >= per:
+                break
+
+    return results
+
 app = Flask(__name__, static_folder=None)
 
 @app.after_request
@@ -457,6 +601,12 @@ def route_names():
 def route_local_types():
     return jsonify(on_main_thread(query_local_types))
 
+@app.route("/api/search")
+def route_search():
+    query = request.args.get("q", "")
+    limit = request.args.get("limit", default=60, type=int)
+    return jsonify(on_main_thread(lambda: query_search(query, limit)))
+
 @app.route("/api/events")
 def route_events():
     def stream():
@@ -512,6 +662,22 @@ def route_comment():
         return {"ok": True}
 
     return jsonify(on_main_thread(do_comment, ida_kernwin.MFF_WRITE))
+
+@app.route("/api/rename-lvar", methods=["POST"])
+def route_rename_lvar():
+    if not ALLOW_WRITE:
+        return Response("writes disabled", status=403)
+    if not _HAS_HEXRAYS:
+        return Response("decompiler unavailable", status=404)
+    data = request.get_json(force=True)
+    ea = parse_ea(data.get("ea"))  # the function's ea
+    old = data.get("old") or ""
+    new = data.get("new") or ""
+
+    def do_rename_lvar():
+        return {"ok": bool(ida_hexrays.rename_lvar(ea, old, new))}
+
+    return jsonify(on_main_thread(do_rename_lvar, ida_kernwin.MFF_WRITE))
 
 LANDING_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>idarem</title>
 <style>body{background:#0b0b0d;color:#e6e6ea;font-family:system-ui;max-width:660px;margin:60px auto;

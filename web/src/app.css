@@ -38,7 +38,6 @@
 }
 
 .theme-select {
-  margin-left: auto;
   background: var(--btn-bg);
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -46,6 +45,21 @@
   padding: 5px 8px;
   cursor: pointer;
   outline: none;
+}
+
+.search-btn {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.kbd {
+  font-size: 11px;
+  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 5px;
 }
 
 .follow.on {
@@ -474,6 +488,95 @@
 
 .xref {
   line-height: 1.5;
+}
+
+/* --- Command palette ----------------------------------------------------- */
+.palette-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+}
+
+.palette {
+  width: min(640px, 92vw);
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.palette-input {
+  border: none;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  padding: 14px 16px;
+  font-size: 15px;
+  outline: none;
+}
+
+.palette-results {
+  overflow-y: auto;
+}
+
+.palette-empty {
+  padding: 14px 16px;
+}
+
+.palette-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 16px;
+  cursor: pointer;
+}
+
+.palette-row.active {
+  background: var(--active);
+}
+
+.palette-kind {
+  flex: none;
+  width: 42px;
+  text-align: center;
+  font-size: 11px;
+  border-radius: 4px;
+  padding: 2px 0;
+  color: var(--bg);
+  background: var(--dim);
+}
+
+.kind-function {
+  background: var(--tok-codename);
+}
+.kind-string {
+  background: var(--tok-str);
+}
+.kind-name {
+  background: var(--tok-dataname);
+}
+.kind-address {
+  background: var(--accent);
+}
+
+.palette-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.palette-ea {
+  flex: none;
 }
 
 /* --- Mobile / tablet ----------------------------------------------------- */

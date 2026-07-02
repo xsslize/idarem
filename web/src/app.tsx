@@ -21,6 +21,7 @@ import {
 import { renderTokens } from "./render-tokens";
 import { GraphView } from "./graph-view";
 import { VirtualList } from "./virtual-list";
+import { CommandPalette } from "./command-palette";
 import "./app.css";
 
 type Tab = "disasm" | "graph" | "pseudo" | "hex" | "strings" | "names" | "imports" | "exports" | "segments" | "types";
@@ -90,6 +91,7 @@ export default function App() {
   const [follow, setFollow] = useState(false);
   const [drive, setDrive] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [theme, setTheme] = useState(() => localStorage.getItem("idarem-theme") || "dark");
 
   useEffect(() => {
@@ -220,6 +222,29 @@ export default function App() {
     return () => source.close();
   }, [follow, client]);
 
+  // Keyboard shortcuts: Ctrl-K or "/" opens search; N renames in Drive mode.
+  useEffect(() => {
+    function onKey(e: globalThis.KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
+      const el = document.activeElement;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+      if (e.key === "/") {
+        e.preventDefault();
+        setPaletteOpen(true);
+      } else if (e.key.toLowerCase() === "n" && drive && selected) {
+        e.preventDefault();
+        renameFunction();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drive, selected, client]);
+
   async function loadHexAt(addrText: string) {
     if (!client) return;
     const ea = toHex(addrText.trim());
@@ -281,6 +306,22 @@ export default function App() {
       setDisasm(await client.disasm(selected.ea));
     } catch (e) {
       setError(`Comment failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function renameLvar(oldName: string) {
+    if (!client || !selected) return;
+    const name = window.prompt(`Rename variable "${oldName}"`, oldName);
+    if (name === null || !name.trim() || name === oldName) return;
+    try {
+      const res = await client.renameLvar(selected.ea, oldName, name.trim());
+      if (!res.ok) {
+        setError(`Rename failed — variable "${oldName}" not found`);
+        return;
+      }
+      setPseudo(await client.pseudocode(selected.ea));
+    } catch (e) {
+      setError(`Rename failed: ${(e as Error).message}`);
     }
   }
 
@@ -355,6 +396,9 @@ export default function App() {
         <span className="dim info">
           {info.file} · {info.processor} · {info.bits}-bit · {info.has_hexrays ? "Hex-Rays" : "no decompiler"} · {functions.length} funcs
         </span>
+        <button className="search-btn" onClick={() => setPaletteOpen(true)} title="Search (Ctrl-K)">
+          Search <span className="kbd">Ctrl-K</span>
+        </button>
         <select className="theme-select" value={theme} onChange={(e) => setTheme(e.target.value)} title="Theme">
           <option value="dark">Dark</option>
           <option value="darcula">Darcula</option>
@@ -460,7 +504,7 @@ export default function App() {
               {pseudo ? (
                 pseudo.lines.map((line, i) => (
                   <div className="codeline" key={i}>
-                    {renderTokens(line.tokens, navigateToAddress)}
+                    {renderTokens(line.tokens, navigateToAddress, drive ? renameLvar : undefined)}
                   </div>
                 ))
               ) : (
@@ -585,6 +629,10 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {paletteOpen && client && (
+        <CommandPalette client={client} onNavigate={navigateToAddress} onClose={() => setPaletteOpen(false)} />
+      )}
     </div>
   );
 }
