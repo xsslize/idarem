@@ -1,7 +1,10 @@
 import os
 import json
 import queue
+import hmac
+import secrets
 import threading
+import time
 
 import ida_idaapi
 import ida_kernwin
@@ -14,6 +17,7 @@ import ida_name
 import ida_segment
 import ida_typeinf
 import ida_gdl
+import ida_xref
 import idautils
 
 try:
@@ -22,13 +26,30 @@ try:
 except Exception:
     _HAS_HEXRAYS = False
 
-from flask import Flask, jsonify, request, Response, send_from_directory
+from flask import Flask, jsonify, request, Response, send_from_directory, g
+from werkzeug.serving import make_server
 
-HOST = "0.0.0.0"
-PORT = 8765
-AUTH_TOKEN = "CreateUrOwnToken"
+HOST = os.environ.get("IDAREM_HOST", "127.0.0.1").strip() or "127.0.0.1"
+PORT = int(os.environ.get("IDAREM_PORT", "8765"))
+AUTH_TOKEN = os.environ.get("IDAREM_AUTH_TOKEN", "").strip()
 WEB_ROOT = ""
-ALLOW_WRITE = True  # set False to refuse rename/comment edits (jumpto is always allowed)
+ALLOW_WRITE = os.environ.get("IDAREM_ALLOW_WRITE", "").strip().lower() in ("1", "true", "yes", "on")
+
+_auth_token_generated = not AUTH_TOKEN or AUTH_TOKEN == "CreateUrOwnToken"
+if _auth_token_generated:
+    AUTH_TOKEN = secrets.token_urlsafe(32)
+
+_cors_origins = {
+    origin.strip()
+    for origin in os.environ.get(
+        "IDAREM_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+}
+for _vite_port in range(5170, 5180):
+    _cors_origins.add(f"http://localhost:{_vite_port}")
+    _cors_origins.add(f"http://127.0.0.1:{_vite_port}")
 
 def on_main_thread(query, flags=ida_kernwin.MFF_READ):
     result = {}
@@ -211,17 +232,54 @@ def parse_pseudocode(line, cfunc):
 def hexea(ea):
     return "0x%X" % (ea & 0xFFFFFFFFFFFFFFFF)
 
+class ApiError(ValueError):
+    pass
+
 def parse_ea(value):
-    return int(value, 16)
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ApiError("address must be a hexadecimal string")
+    try:
+        address = int(str(value).strip(), 16)
+    except (TypeError, ValueError):
+        raise ApiError("invalid hexadecimal address")
+    if address < 0 or address >= ida_idaapi.BADADDR:
+        raise ApiError("address is outside the valid range")
+    return address
+
+def json_object():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ApiError("request body must be a JSON object")
+    return data
+
+def text_field(data, name, maximum, allow_empty=True):
+    value = data.get(name, "")
+    if not isinstance(value, str):
+        raise ApiError(f"{name} must be a string")
+    if not allow_empty and not value.strip():
+        raise ApiError(f"{name} must not be empty")
+    if len(value) > maximum:
+        raise ApiError(f"{name} is too long")
+    return value
 
 _event_subscribers = set()
 _event_lock = threading.Lock()
+_server_stop_event = threading.Event()
+_MAX_EVENT_SUBSCRIBERS = 8
+_EVENT_QUEUE_SIZE = 16
 
 def publish_event(event):
     data = json.dumps(event)
     with _event_lock:
         for subscriber in list(_event_subscribers):
-            subscriber.put(data)
+            try:
+                subscriber.put_nowait(data)
+            except queue.Full:
+                try:
+                    subscriber.get_nowait()
+                    subscriber.put_nowait(data)
+                except (queue.Empty, queue.Full):
+                    pass
 
 def _build_view_map():
     pairs = [
@@ -311,11 +369,14 @@ def query_info():
         "bits": bits,
         "image_base": hexea(ida_nalt.get_imagebase()),
         "has_hexrays": bool(_HAS_HEXRAYS),
+        "allow_write": ALLOW_WRITE,
     }
 
 def query_functions():
     functions = []
     for start_ea in idautils.Functions():
+        if len(functions) >= 100000:
+            raise ApiError("database contains more than 100000 functions")
         func = ida_funcs.get_func(start_ea)
         functions.append(
             {
@@ -332,6 +393,8 @@ def query_disassembly(ea):
         return None
     lines = []
     for head in idautils.FuncItems(func.start_ea):
+        if len(lines) >= 100000:
+            raise ApiError("function contains too many disassembly lines")
         tagged = ida_lines.generate_disasm_line(head, 0) or ""
         lines.append({"ea": hexea(head), "tokens": parse_tagged(tagged)})
     return {"ea": hexea(func.start_ea), "name": ida_funcs.get_func_name(func.start_ea), "lines": lines}
@@ -344,12 +407,19 @@ def query_graph(ea):
     blocks = []
     edges = []
     for block in flow:
+        if len(blocks) >= 2000:
+            raise ApiError("control-flow graph contains more than 2000 blocks")
         lines = []
         head = block.start_ea
         while head < block.end_ea and head != ida_idaapi.BADADDR:
+            if len(lines) >= 10000:
+                raise ApiError("control-flow block contains too many lines")
             tagged = ida_lines.generate_disasm_line(head, 0) or ""
             lines.append({"ea": hexea(head), "tokens": parse_tagged(tagged)})
-            head = ida_bytes.get_item_end(head)
+            next_head = ida_bytes.get_item_end(head)
+            if next_head <= head:
+                raise ApiError("IDA returned an invalid item boundary")
+            head = next_head
         successors = list(block.succs())
         for succ in successors:
             if len(successors) == 2:
@@ -381,7 +451,11 @@ def query_pseudocode(ea):
     decompiled = ida_hexrays.decompile(func.start_ea)
     if decompiled is None:
         return None
-    lines = [{"tokens": parse_pseudocode(item.line, decompiled)} for item in decompiled.get_pseudocode()]
+    lines = []
+    for item in decompiled.get_pseudocode():
+        if len(lines) >= 100000:
+            raise ApiError("function contains too many pseudocode lines")
+        lines.append({"tokens": parse_pseudocode(item.line, decompiled)})
     return {"ea": hexea(func.start_ea), "name": ida_funcs.get_func_name(func.start_ea), "lines": lines}
 
 def query_xrefs(ea):
@@ -391,7 +465,7 @@ def query_xrefs(ea):
             {
                 "frm": hexea(xref.frm),
                 "name": ida_funcs.get_func_name(xref.frm) or "",
-                "is_call": bool(xref.iscode),
+                "is_call": xref.type in (ida_xref.fl_CF, ida_xref.fl_CN),
             }
         )
     return references
@@ -410,15 +484,21 @@ def query_imports():
         module_name = ida_nalt.get_import_module_name(module_index) or ""
 
         def collect(ea, name, ordinal, _module=module_name):
+            if len(items) >= 100000:
+                return False
             items.append({"ea": hexea(ea), "module": _module, "name": name or "", "ordinal": ordinal or 0})
             return True
 
         ida_nalt.enum_import_names(module_index, collect)
+        if len(items) >= 100000:
+            raise ApiError("database contains more than 100000 imports")
     return items
 
 def query_exports():
     items = []
     for _index, ordinal, ea, name in idautils.Entries():
+        if len(items) >= 100000:
+            raise ApiError("database contains more than 100000 exports")
         items.append({"ea": hexea(ea), "ordinal": ordinal, "name": name or ""})
     return items
 
@@ -456,90 +536,156 @@ def query_local_types():
     items = []
     try:
         til = ida_typeinf.get_idati()
-        try:
-            count = ida_typeinf.get_ordinal_count(til)
-        except Exception:
-            count = ida_typeinf.get_ordinal_qty(til)
-        for ordinal in range(1, count + 1):
+        limit = ida_typeinf.get_ordinal_limit(til)
+        if limit < 0 or limit > 100001:
+            raise ApiError("local type ordinal range is too large")
+        for ordinal in range(1, limit):
             tif = ida_typeinf.tinfo_t()
             if not tif.get_numbered_type(til, ordinal):
                 continue
-            name = tif.get_type_name() or ""
-            try:
-                decl = tif._print(name or None, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_TYPE)
-            except Exception:
-                decl = ""
+            name = ida_typeinf.get_numbered_type_name(til, ordinal) or tif.get_type_name() or ""
+            decl = ida_typeinf.print_tinfo(
+                "",
+                0,
+                0,
+                ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_TYPE,
+                tif,
+                name,
+                "",
+            )
             items.append({"ordinal": ordinal, "name": name, "decl": decl or str(tif)})
     except Exception as error:
         return {"error": str(error), "items": []}
     return {"items": items}
 
-def query_search(query, limit):
+_search_index = None
+_search_index_built_at = 0.0
+_search_index_lock = threading.Lock()
+
+def query_search_index():
+    index = {"function": [], "string": [], "name": []}
+    for start_ea in idautils.Functions():
+        name = ida_funcs.get_func_name(start_ea) or ""
+        index["function"].append((start_ea, name, name.lower()))
+    for string_item in idautils.Strings():
+        text = str(string_item)[:120]
+        index["string"].append((string_item.ea, text, text.lower()))
+        if len(index["string"]) >= 50000:
+            break
+    for ea, name in idautils.Names():
+        index["name"].append((ea, name, name.lower()))
+        if len(index["name"]) >= 50000:
+            break
+    return index
+
+def get_search_index():
+    global _search_index, _search_index_built_at
+    with _search_index_lock:
+        if _search_index is None or time.monotonic() - _search_index_built_at > 30:
+            _search_index = on_main_thread(query_search_index)
+            _search_index_built_at = time.monotonic()
+        return _search_index
+
+def invalidate_search_index():
+    global _search_index, _search_index_built_at
+    with _search_index_lock:
+        _search_index = None
+        _search_index_built_at = 0.0
+
+def search_index(query, limit):
     query = (query or "").strip()
     if not query:
         return []
+    limit = max(1, min(int(limit), 100))
     low = query.lower()
-    per = max(5, limit // 4)  # keep each category's share balanced
     results = []
 
-    def add(kind, ea, label):
-        results.append({"kind": kind, "ea": hexea(ea), "label": label})
-
-    # Exact hex address, if the query parses as one and is mapped.
     try:
-        addr = int(query, 16)
-        if ida_bytes.is_loaded(addr):
-            add("address", addr, ida_funcs.get_func_name(addr) or ida_name.get_name(addr) or hexea(addr))
-    except Exception:
+        address = parse_ea(query)
+        if on_main_thread(lambda: ida_bytes.is_loaded(address)):
+            label = on_main_thread(lambda: ida_funcs.get_func_name(address) or ida_name.get_name(address) or hexea(address))
+            results.append({"kind": "address", "ea": hexea(address), "label": label})
+    except ApiError:
         pass
 
-    count = 0
-    for start_ea in idautils.Functions():
-        name = ida_funcs.get_func_name(start_ea) or ""
-        if low in name.lower():
-            add("function", start_ea, name)
-            count += 1
-            if count >= per:
-                break
-
-    count = 0
-    for string_item in idautils.Strings():
-        text = str(string_item)
-        if low in text.lower():
-            add("string", string_item.ea, text[:120])
-            count += 1
-            if count >= per:
-                break
-
-    count = 0
-    for ea, name in idautils.Names():
-        if low in name.lower():
-            add("name", ea, name)
-            count += 1
-            if count >= per:
-                break
-
-    return results
+    per_category = max(1, (limit - len(results)) // 3)
+    index = get_search_index()
+    for kind in ("function", "string", "name"):
+        count = 0
+        for ea, label, normalized in index[kind]:
+            if low in normalized:
+                results.append({"kind": kind, "ea": hexea(ea), "label": label})
+                count += 1
+                if count >= per_category or len(results) >= limit:
+                    break
+        if len(results) >= limit:
+            break
+    return results[:limit]
 
 app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+_api_slots = threading.BoundedSemaphore(8)
+_rate_limits = {}
+_rate_limit_lock = threading.Lock()
+
+def rate_limited(scope, maximum, seconds):
+    now = time.monotonic()
+    key = (request.remote_addr or "unknown", scope)
+    with _rate_limit_lock:
+        started, count = _rate_limits.get(key, (now, 0))
+        if now - started >= seconds:
+            started, count = now, 0
+        count += 1
+        _rate_limits[key] = (started, count)
+        if len(_rate_limits) > 256:
+            expired = [entry for entry, value in _rate_limits.items() if now - value[0] >= max(seconds, 60)]
+            for entry in expired:
+                _rate_limits.pop(entry, None)
+        return count > maximum
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    if getattr(g, "api_slot", False):
+        _api_slots.release()
+        g.api_slot = False
+    origin = request.headers.get("Origin", "")
+    if origin in _cors_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers.add("Vary", "Origin")
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    if request.path.startswith("/api"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     return response
 
 @app.before_request
 def check_auth():
+    if not request.path.startswith("/api"):
+        return
     if request.method == "OPTIONS":
         return
-    if AUTH_TOKEN and request.path.startswith("/api"):
-        if request.headers.get("Authorization", "") == f"Bearer {AUTH_TOKEN}":
-            return
-        if request.args.get("token", "") == AUTH_TOKEN:
-            return
+    supplied = request.headers.get("Authorization", "").encode("utf-8", errors="replace")
+    expected = f"Bearer {AUTH_TOKEN}".encode("utf-8")
+    if not hmac.compare_digest(supplied, expected):
+        if rate_limited("auth", 20, 60):
+            return Response("too many authentication attempts", status=429, headers={"Retry-After": "60"})
         return Response("unauthorized", status=401)
+    if request.path != "/api/events":
+        if not _api_slots.acquire(blocking=False):
+            return Response("server busy", status=503, headers={"Retry-After": "1"})
+        g.api_slot = True
+
+@app.errorhandler(ApiError)
+def handle_api_error(error):
+    return jsonify({"error": str(error)}), 400
+
+@app.errorhandler(413)
+def handle_request_too_large(_error):
+    return jsonify({"error": "request body is too large"}), 413
 
 @app.route("/api/info")
 def route_info():
@@ -603,22 +749,30 @@ def route_local_types():
 
 @app.route("/api/search")
 def route_search():
+    if rate_limited("search", 10, 1):
+        return Response("search rate limit exceeded", status=429, headers={"Retry-After": "1"})
     query = request.args.get("q", "")
     limit = request.args.get("limit", default=60, type=int)
-    return jsonify(on_main_thread(lambda: query_search(query, limit)))
+    return jsonify(search_index(query, limit if limit is not None else 60))
 
 @app.route("/api/events")
 def route_events():
+    subscriber = queue.Queue(maxsize=_EVENT_QUEUE_SIZE)
+    with _event_lock:
+        if len(_event_subscribers) >= _MAX_EVENT_SUBSCRIBERS:
+            return Response("too many event subscribers", status=503, headers={"Retry-After": "5"})
+        _event_subscribers.add(subscriber)
+
     def stream():
-        subscriber = queue.Queue()
-        with _event_lock:
-            _event_subscribers.add(subscriber)
         try:
             current = on_main_thread(lambda: hexea(ida_kernwin.get_screen_ea()))
             yield "data: %s\n\n" % json.dumps({"type": "screen_ea", "ea": current})
-            while True:
+            while not _server_stop_event.is_set():
                 try:
-                    yield "data: %s\n\n" % subscriber.get(timeout=15)
+                    event = subscriber.get(timeout=15)
+                    if event is None:
+                        break
+                    yield "data: %s\n\n" % event
                 except queue.Empty:
                     yield ": ping\n\n"
         finally:
@@ -630,36 +784,40 @@ def route_events():
 
 @app.route("/api/goto", methods=["POST"])
 def route_goto():
-    ea = parse_ea(request.get_json(force=True).get("ea"))
-    on_main_thread(lambda: ida_kernwin.jumpto(ea))
-    return jsonify({"ok": True})
+    ea = parse_ea(json_object().get("ea"))
+    ok = on_main_thread(lambda: ida_kernwin.jumpto(ea))
+    return jsonify({"ok": bool(ok)})
 
 @app.route("/api/rename", methods=["POST"])
 def route_rename():
     if not ALLOW_WRITE:
         return Response("writes disabled", status=403)
-    data = request.get_json(force=True)
+    data = json_object()
     ea = parse_ea(data.get("ea"))
-    name = data.get("name") or ""
+    name = text_field(data, "name", 512)
 
     def do_rename():
         ok = ida_name.set_name(ea, name, ida_name.SN_NOWARN)
         return {"ok": bool(ok), "name": ida_name.get_name(ea) or ""}
 
-    return jsonify(on_main_thread(do_rename, ida_kernwin.MFF_WRITE))
+    result = on_main_thread(do_rename, ida_kernwin.MFF_WRITE)
+    if result["ok"]:
+        invalidate_search_index()
+    return jsonify(result)
 
 @app.route("/api/comment", methods=["POST"])
 def route_comment():
     if not ALLOW_WRITE:
         return Response("writes disabled", status=403)
-    data = request.get_json(force=True)
+    data = json_object()
     ea = parse_ea(data.get("ea"))
-    text = data.get("text") or ""
-    repeatable = bool(data.get("repeatable", False))
+    text = text_field(data, "text", 65535)
+    repeatable = data.get("repeatable", False)
+    if not isinstance(repeatable, bool):
+        raise ApiError("repeatable must be a boolean")
 
     def do_comment():
-        ida_bytes.set_cmt(ea, text, repeatable)
-        return {"ok": True}
+        return {"ok": bool(ida_bytes.set_cmt(ea, text, repeatable))}
 
     return jsonify(on_main_thread(do_comment, ida_kernwin.MFF_WRITE))
 
@@ -669,10 +827,10 @@ def route_rename_lvar():
         return Response("writes disabled", status=403)
     if not _HAS_HEXRAYS:
         return Response("decompiler unavailable", status=404)
-    data = request.get_json(force=True)
-    ea = parse_ea(data.get("ea"))  # the function's ea
-    old = data.get("old") or ""
-    new = data.get("new") or ""
+    data = json_object()
+    ea = parse_ea(data.get("ea"))
+    old = text_field(data, "old", 512, allow_empty=False)
+    new = text_field(data, "new", 512, allow_empty=False)
 
     def do_rename_lvar():
         return {"ok": bool(ida_hexrays.rename_lvar(ea, old, new))}
@@ -714,30 +872,65 @@ def serve_web(path):
         return send_from_directory(root, "index.html")
     return Response(LANDING_PAGE, mimetype="text/html")
 
+_server = None
 _server_thread = None
+_server_lock = threading.Lock()
 
 def start_server():
-    global _server_thread, _screen_hooks
+    global _server, _server_thread, _screen_hooks
+    with _server_lock:
+        if _server_thread is not None and _server_thread.is_alive():
+            print(f"[idarem] already serving on port {PORT}")
+            return True
+        try:
+            server = make_server(HOST, PORT, app, threaded=True)
+        except OSError as error:
+            print(f"[idarem] failed to bind {HOST}:{PORT}: {error}")
+            return False
+        _server = server
+        _server_stop_event.clear()
+        _server_thread = threading.Thread(target=server.serve_forever, name="idarem", daemon=True)
+        _server_thread.start()
+
     if _screen_hooks is None:
         _screen_hooks = _ScreenHooks()
         _screen_hooks.hook()
-    if _server_thread is not None and _server_thread.is_alive():
-        print(f"[idarem] already serving on port {PORT}")
-        return
-
-    def serve():
-        app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
-
-    _server_thread = threading.Thread(target=serve, name="idarem", daemon=True)
-    _server_thread.start()
     print(f"[idarem] serving on http://{HOST}:{PORT}  (hexrays={'yes' if _HAS_HEXRAYS else 'no'})")
-    if not AUTH_TOKEN:
-        print(
-            "[idarem] WARNING: AUTH_TOKEN is empty — the API is UNAUTHENTICATED. "
-            "Because responses send 'Access-Control-Allow-Origin: *', any website your "
-            "browser visits can read this database while the server runs. Set AUTH_TOKEN "
-            "(and prefer a tunnel over binding a public port) before exposing it."
-        )
+    if _auth_token_generated:
+        print(f"[idarem] generated session token: {AUTH_TOKEN}")
+        print("[idarem] set IDAREM_AUTH_TOKEN for a stable token across restarts")
+    if not ALLOW_WRITE:
+        print("[idarem] write-back is disabled (set IDAREM_ALLOW_WRITE=1 to enable it)")
+    return True
+
+def stop_server():
+    global _server, _server_thread, _screen_hooks
+    with _server_lock:
+        server = _server
+        thread = _server_thread
+        _server = None
+        _server_thread = None
+    if server is None:
+        print("[idarem] server is not running")
+        return False
+    _server_stop_event.set()
+    with _event_lock:
+        for subscriber in list(_event_subscribers):
+            try:
+                subscriber.put_nowait(None)
+            except queue.Full:
+                pass
+    server.shutdown()
+    server.server_close()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2)
+    if _screen_hooks is not None:
+        _screen_hooks.unhook()
+        _screen_hooks = None
+    with _event_lock:
+        _event_subscribers.clear()
+    print("[idarem] server stopped")
+    return True
 
 class IdaRemotePlugin(ida_idaapi.plugin_t):
     flags = 0
@@ -750,13 +943,14 @@ class IdaRemotePlugin(ida_idaapi.plugin_t):
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
-        start_server()
+        if _server_thread is not None and _server_thread.is_alive():
+            stop_server()
+        else:
+            start_server()
 
     def term(self):
-        global _screen_hooks
-        if _screen_hooks is not None:
-            _screen_hooks.unhook()
-            _screen_hooks = None
+        if _server_thread is not None and _server_thread.is_alive():
+            stop_server()
 
 def PLUGIN_ENTRY():
     return IdaRemotePlugin()

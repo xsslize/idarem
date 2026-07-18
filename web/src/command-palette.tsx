@@ -36,10 +36,11 @@ export function CommandPalette({
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
     setBusy(true);
     const timer = setTimeout(async () => {
       try {
-        const found = await client.search(q);
+        const found = await client.search(q, 60, controller.signal);
         if (!cancelled) {
           setResults(found);
           setSel(0);
@@ -52,6 +53,7 @@ export function CommandPalette({
     }, 220);
     return () => {
       cancelled = true;
+      controller.abort();
       clearTimeout(timer);
     };
   }, [query, client]);

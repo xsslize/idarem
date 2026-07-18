@@ -10,6 +10,7 @@ export interface Info {
   bits: number;
   image_base: Ea;
   has_hexrays: boolean;
+  allow_write: boolean;
 }
 
 export interface FunctionEntry {
@@ -129,6 +130,12 @@ export interface SearchResult {
   label: string;
 }
 
+export interface ServerEvent {
+  type: "screen_ea" | "view";
+  ea?: Ea;
+  view?: string;
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token: string;
@@ -138,20 +145,35 @@ export class ApiClient {
     this.token = token;
   }
 
-  private async get<T>(path: string): Promise<T> {
-    const headers: Record<string, string> = {};
-    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
-    const response = await fetch(`${this.baseUrl}${path}`, { headers });
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    return (await response.json()) as T;
+  private async request<T>(path: string, init: RequestInit, signal?: AbortSignal): Promise<T> {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 15_000);
+    const abort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      const response = await fetch(`${this.baseUrl}${path}`, { ...init, signal: controller.signal });
+      if (!response.ok) {
+        const detail = (await response.text()).trim();
+        throw new Error(`${response.status} ${detail || response.statusText}`);
+      }
+      return (await response.json()) as T;
+    } finally {
+      window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+    }
   }
 
-  private async post<T>(path: string, body: unknown): Promise<T> {
+  private async get<T>(path: string, signal?: AbortSignal): Promise<T> {
+    const headers: Record<string, string> = {};
+    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
+    return this.request<T>(path, { headers }, signal);
+  }
+
+  private async post<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
-    const response = await fetch(`${this.baseUrl}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    return (await response.json()) as T;
+    return this.request<T>(path, { method: "POST", headers, body: JSON.stringify(body) }, signal);
   }
 
   info() {
@@ -160,17 +182,17 @@ export class ApiClient {
   functions() {
     return this.get<FunctionEntry[]>("/api/functions");
   }
-  disasm(ea: Ea) {
-    return this.get<Disassembly>(`/api/disasm/${ea}`);
+  disasm(ea: Ea, signal?: AbortSignal) {
+    return this.get<Disassembly>(`/api/disasm/${ea}`, signal);
   }
-  graph(ea: Ea) {
-    return this.get<Graph>(`/api/graph/${ea}`);
+  graph(ea: Ea, signal?: AbortSignal) {
+    return this.get<Graph>(`/api/graph/${ea}`, signal);
   }
-  pseudocode(ea: Ea) {
-    return this.get<Pseudocode>(`/api/pseudocode/${ea}`);
+  pseudocode(ea: Ea, signal?: AbortSignal) {
+    return this.get<Pseudocode>(`/api/pseudocode/${ea}`, signal);
   }
-  xrefs(ea: Ea) {
-    return this.get<Xref[]>(`/api/xrefs/${ea}`);
+  xrefs(ea: Ea, signal?: AbortSignal) {
+    return this.get<Xref[]>(`/api/xrefs/${ea}`, signal);
   }
   strings() {
     return this.get<StringItem[]>("/api/strings");
@@ -193,13 +215,42 @@ export class ApiClient {
   localTypes() {
     return this.get<LocalTypesResult>("/api/local-types");
   }
-  search(query: string, limit = 60) {
-    return this.get<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+  search(query: string, limit = 60, signal?: AbortSignal) {
+    return this.get<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}&limit=${limit}`, signal);
   }
-  // EventSource can't send headers, so the token rides as a query param.
-  eventsUrl() {
-    const q = this.token ? `?token=${encodeURIComponent(this.token)}` : "";
-    return `${this.baseUrl}/api/events${q}`;
+  async events(onEvent: (event: ServerEvent) => void, signal: AbortSignal): Promise<void> {
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
+    const response = await fetch(`${this.baseUrl}/api/events`, { headers, signal, cache: "no-store" });
+    if (!response.ok || !response.body) throw new Error(`${response.status} ${response.statusText}`);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (!signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      if (buffer.length > 1_000_000) throw new Error("SSE event exceeded the size limit");
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = block
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (data) {
+          try {
+            onEvent(JSON.parse(data) as ServerEvent);
+          } catch {
+            // Ignore a malformed event without dropping the live connection.
+          }
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
   }
 
   // Write-back commands (web -> IDA).

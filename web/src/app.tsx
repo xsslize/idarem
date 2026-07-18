@@ -45,8 +45,13 @@ const TAB_LABEL: Record<Tab, string> = {
 function buildBaseUrl(host: string, port: string): string {
   const h = host.trim().replace(/\/$/, "");
   const p = port.trim();
-  if (h.includes("://")) return p && !/:\d+$/.test(h) ? `${h}:${p}` : h;
-  return `http://${h}${p ? ":" + p : ""}`;
+  if (h.includes("://")) {
+    const url = new URL(h);
+    if (p && !url.port) url.port = p;
+    return url.toString().replace(/\/$/, "");
+  }
+  const normalized = h.includes(":") && !h.startsWith("[") ? `[${h}]` : h;
+  return `http://${normalized}${p ? ":" + p : ""}`;
 }
 
 // Where to point the client by default. When the page is served by the plugin
@@ -92,7 +97,17 @@ export default function App() {
   const [drive, setDrive] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [tokenVisible, setTokenVisible] = useState(false);
   const [theme, setTheme] = useState(() => localStorage.getItem("idarem-theme") || "dark");
+  const selectionRequest = useRef<AbortController | null>(null);
+  const selectionGeneration = useRef(0);
+  const tabGeneration = useRef(0);
+  const hexGeneration = useRef(0);
+  const stringXrefGeneration = useRef(0);
+  const selectedRef = useRef<FunctionEntry | null>(null);
+  const clientRef = useRef<ApiClient | null>(null);
+  selectedRef.current = selected;
+  clientRef.current = client;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme; // theme the whole document
@@ -105,6 +120,8 @@ export default function App() {
     try {
       const next = new ApiClient(buildBaseUrl(host, port), token);
       const [fetchedInfo, fetchedFunctions] = await Promise.all([next.info(), next.functions()]);
+      clientRef.current = next;
+      tabGeneration.current++;
       setClient(next);
       setInfo(fetchedInfo);
       setFunctions(fetchedFunctions);
@@ -125,6 +142,7 @@ export default function App() {
       setHexAddr(toHex(fetchedInfo.image_base));
     } catch (e) {
       setError(`Connection failed: ${(e as Error).message}`);
+      clientRef.current = null;
       setClient(null);
       setInfo(null);
     } finally {
@@ -133,6 +151,12 @@ export default function App() {
   }
 
   function disconnect() {
+    selectionRequest.current?.abort();
+    selectionGeneration.current++;
+    tabGeneration.current++;
+    hexGeneration.current++;
+    stringXrefGeneration.current++;
+    clientRef.current = null;
     setClient(null);
     setInfo(null);
     setError("");
@@ -140,6 +164,10 @@ export default function App() {
 
   async function selectFunction(fn: FunctionEntry) {
     if (!client) return;
+    selectionRequest.current?.abort();
+    const controller = new AbortController();
+    selectionRequest.current = controller;
+    const generation = ++selectionGeneration.current;
     setNavOpen(false); // close the mobile function drawer once one is picked
     setSelected(fn);
     setDisasm(null);
@@ -147,15 +175,22 @@ export default function App() {
     setPseudo(null);
     setXrefs([]);
     try {
-      const [d, x] = await Promise.all([client.disasm(fn.ea), client.xrefs(fn.ea)]);
+      const [d, x] = await Promise.all([client.disasm(fn.ea, controller.signal), client.xrefs(fn.ea, controller.signal)]);
+      if (controller.signal.aborted || generation !== selectionGeneration.current) return;
       setDisasm(d);
       setXrefs(x);
       // Graph and pseudocode are loaded only for the tab actually in view —
       // decompilation in particular is too expensive to run on every click.
-      if (tab === "graph") setGraph(await client.graph(fn.ea));
-      if (tab === "pseudo" && info?.has_hexrays) setPseudo(await client.pseudocode(fn.ea));
+      if (tab === "graph") {
+        const nextGraph = await client.graph(fn.ea, controller.signal);
+        if (!controller.signal.aborted && generation === selectionGeneration.current) setGraph(nextGraph);
+      }
+      if (tab === "pseudo" && info?.has_hexrays) {
+        const nextPseudo = await client.pseudocode(fn.ea, controller.signal);
+        if (!controller.signal.aborted && generation === selectionGeneration.current) setPseudo(nextPseudo);
+      }
     } catch (e) {
-      setError(`Load failed: ${(e as Error).message}`);
+      if (!controller.signal.aborted) setError(`Load failed: ${(e as Error).message}`);
     }
   }
 
@@ -192,7 +227,7 @@ export default function App() {
     if (target.ea !== selected?.ea) selectFunction(target);
   }
 
-  // Live refs so the EventSource handler always calls the latest closures.
+  // Live refs so the SSE handler always calls the latest closures.
   const navRef = useRef(navigateToAddress);
   navRef.current = navigateToAddress;
   const showTabRef = useRef<(t: Tab) => void>(() => {});
@@ -203,23 +238,25 @@ export default function App() {
     if (highlightEa && flashRef.current) flashRef.current.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [highlightEa, disasm]);
 
-  // "Follow IDA": mirror IDA's current address and active view (which window
-  // you're in — disassembly, pseudocode, strings, …) over SSE.
+  // "Follow IDA": mirror IDA's current address and active view over SSE.
   useEffect(() => {
     if (!follow || !client) return;
-    const source = new EventSource(client.eventsUrl());
-    source.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data) as { type: string; ea?: string; view?: string };
-        // Address selects the function; the tab is driven by "view" events, so
-        // don't let address-follow override the active tab.
-        if (msg.type === "screen_ea" && msg.ea) navRef.current(msg.ea, false);
-        else if (msg.type === "view" && msg.view && (TABS as string[]).includes(msg.view)) showTabRef.current(msg.view as Tab);
-      } catch {
-        // ignore malformed events
+    const controller = new AbortController();
+    const receive = async () => {
+      while (!controller.signal.aborted) {
+        try {
+          await client.events((msg) => {
+            if (msg.type === "screen_ea" && msg.ea) navRef.current(msg.ea, false);
+            else if (msg.type === "view" && msg.view && (TABS as string[]).includes(msg.view)) showTabRef.current(msg.view as Tab);
+          }, controller.signal);
+        } catch {
+          if (controller.signal.aborted) break;
+        }
+        if (!controller.signal.aborted) await new Promise((resolve) => window.setTimeout(resolve, 1500));
       }
     };
-    return () => source.close();
+    void receive();
+    return () => controller.abort();
   }, [follow, client]);
 
   // Keyboard shortcuts: Ctrl-K or "/" opens search; N renames in Drive mode.
@@ -235,7 +272,7 @@ export default function App() {
       if (e.key === "/") {
         e.preventDefault();
         setPaletteOpen(true);
-      } else if (e.key.toLowerCase() === "n" && drive && selected) {
+      } else if (e.key.toLowerCase() === "n" && drive && info?.allow_write && selected) {
         e.preventDefault();
         renameFunction();
       }
@@ -247,6 +284,8 @@ export default function App() {
 
   async function loadHexAt(addrText: string) {
     if (!client) return;
+    const activeClient = client;
+    const generation = ++hexGeneration.current;
     const ea = toHex(addrText.trim());
     try {
       BigInt(ea);
@@ -254,18 +293,22 @@ export default function App() {
       return; // not a valid address
     }
     try {
-      setHexData(await client.hex(ea, 2048));
+      const result = await client.hex(ea, 2048);
+      if (clientRef.current === activeClient && hexGeneration.current === generation) setHexData(result);
     } catch (e) {
-      setError(`Load failed: ${(e as Error).message}`);
+      if (clientRef.current === activeClient && hexGeneration.current === generation) setError(`Load failed: ${(e as Error).message}`);
     }
   }
 
   async function showStringXrefs(ea: Ea) {
     if (!client) return;
+    const activeClient = client;
+    const generation = ++stringXrefGeneration.current;
     try {
-      setStrXrefs({ ea, items: await client.xrefs(ea) });
+      const items = await client.xrefs(ea);
+      if (clientRef.current === activeClient && stringXrefGeneration.current === generation) setStrXrefs({ ea, items });
     } catch (e) {
-      setError(`Load failed: ${(e as Error).message}`);
+      if (clientRef.current === activeClient && stringXrefGeneration.current === generation) setError(`Load failed: ${(e as Error).message}`);
     }
   }
 
@@ -283,15 +326,24 @@ export default function App() {
 
   async function renameFunction() {
     if (!client || !selected) return;
-    const name = window.prompt("Rename function", selected.name);
-    if (name === null || name === selected.name) return;
+    const activeClient = client;
+    const target = selected;
+    const generation = selectionGeneration.current;
+    const name = window.prompt("Rename function", target.name);
+    if (name === null || name === target.name) return;
     try {
-      await client.rename(selected.ea, name);
+      const result = await client.rename(target.ea, name);
+      if (!result.ok) throw new Error("IDA rejected the new name");
       const fns = await client.functions();
+      if (clientRef.current !== activeClient) return;
       setFunctions(fns);
-      setSelected(fns.find((f) => f.ea === selected.ea) ?? selected);
-      setDisasm(await client.disasm(selected.ea));
-      if (tab === "pseudo" && info?.has_hexrays) setPseudo(await client.pseudocode(selected.ea));
+      if (selectionGeneration.current !== generation || selectedRef.current?.ea !== target.ea) return;
+      const updatedDisasm = await client.disasm(target.ea);
+      const updatedPseudo = tab === "pseudo" && info?.has_hexrays ? await client.pseudocode(target.ea) : null;
+      if (clientRef.current !== activeClient || selectionGeneration.current !== generation || selectedRef.current?.ea !== target.ea) return;
+      setSelected(fns.find((f) => f.ea === target.ea) ?? target);
+      setDisasm(updatedDisasm);
+      if (updatedPseudo) setPseudo(updatedPseudo);
     } catch (e) {
       setError(`Rename failed: ${(e as Error).message}`);
     }
@@ -299,11 +351,16 @@ export default function App() {
 
   async function setCommentAt(ea: Ea) {
     if (!client || !selected) return;
+    const activeClient = client;
+    const target = selected;
+    const generation = selectionGeneration.current;
     const text = window.prompt(`Comment at ${toHex(ea)}`, "");
     if (text === null) return;
     try {
-      await client.comment(ea, text);
-      setDisasm(await client.disasm(selected.ea));
+      const result = await client.comment(ea, text);
+      if (!result.ok) throw new Error("IDA rejected the comment");
+      const updated = await client.disasm(target.ea);
+      if (clientRef.current === activeClient && selectionGeneration.current === generation && selectedRef.current?.ea === target.ea) setDisasm(updated);
     } catch (e) {
       setError(`Comment failed: ${(e as Error).message}`);
     }
@@ -311,15 +368,19 @@ export default function App() {
 
   async function renameLvar(oldName: string) {
     if (!client || !selected) return;
+    const activeClient = client;
+    const target = selected;
+    const generation = selectionGeneration.current;
     const name = window.prompt(`Rename variable "${oldName}"`, oldName);
     if (name === null || !name.trim() || name === oldName) return;
     try {
-      const res = await client.renameLvar(selected.ea, oldName, name.trim());
+      const res = await client.renameLvar(target.ea, oldName, name.trim());
       if (!res.ok) {
         setError(`Rename failed — variable "${oldName}" not found`);
         return;
       }
-      setPseudo(await client.pseudocode(selected.ea));
+      const updated = await client.pseudocode(target.ea);
+      if (clientRef.current === activeClient && selectionGeneration.current === generation && selectedRef.current?.ea === target.ea) setPseudo(updated);
     } catch (e) {
       setError(`Rename failed: ${(e as Error).message}`);
     }
@@ -328,22 +389,54 @@ export default function App() {
   async function showTab(next: Tab) {
     setTab(next);
     if (!client) return;
+    const activeClient = client;
+    const functionEa = selectedRef.current?.ea;
+    const generation = ++tabGeneration.current;
+    const isCurrent = () => clientRef.current === activeClient && tabGeneration.current === generation;
     try {
-      if (next === "graph" && graph === null && selected) setGraph(await client.graph(selected.ea));
-      if (next === "pseudo" && pseudo === null && selected && info?.has_hexrays) setPseudo(await client.pseudocode(selected.ea));
-      if (next === "strings" && strings === null) setStrings(await client.strings());
-      if (next === "imports" && imports === null) setImports(await client.imports());
-      if (next === "exports" && exports === null) setExports(await client.exports());
-      if (next === "segments" && segments === null) setSegments(await client.segments());
-      if (next === "names" && names === null) setNames(await client.names());
+      if (next === "graph" && graph === null && functionEa) {
+        const result = await client.graph(functionEa);
+        if (isCurrent() && selectedRef.current?.ea === functionEa) setGraph(result);
+      }
+      if (next === "pseudo" && pseudo === null && functionEa && info?.has_hexrays) {
+        const result = await client.pseudocode(functionEa);
+        if (isCurrent() && selectedRef.current?.ea === functionEa) setPseudo(result);
+      }
+      if (next === "strings" && strings === null) {
+        const result = await client.strings();
+        if (isCurrent()) {
+          setNames(null);
+          setStrings(result);
+        }
+      }
+      if (next === "imports" && imports === null) {
+        const result = await client.imports();
+        if (isCurrent()) setImports(result);
+      }
+      if (next === "exports" && exports === null) {
+        const result = await client.exports();
+        if (isCurrent()) setExports(result);
+      }
+      if (next === "segments" && segments === null) {
+        const result = await client.segments();
+        if (isCurrent()) setSegments(result);
+      }
+      if (next === "names" && names === null) {
+        const result = await client.names();
+        if (isCurrent()) {
+          setStrings(null);
+          setStrXrefs(null);
+          setNames(result);
+        }
+      }
       if (next === "types" && localTypes === null) {
         const result = await client.localTypes();
-        setLocalTypes(result.items);
-        if (result.error) setError(`Local types: ${result.error}`);
+        if (result.error) throw new Error(`Local types: ${result.error}`);
+        if (isCurrent()) setLocalTypes(result.items);
       }
       if (next === "hex" && hexData === null) await loadHexAt(hexAddr || info?.image_base || "0");
     } catch (e) {
-      setError(`Load failed: ${(e as Error).message}`);
+      if (isCurrent()) setError(`Load failed: ${(e as Error).message}`);
     }
   }
   showTabRef.current = showTab;
@@ -376,7 +469,19 @@ export default function App() {
             <input className="grow" value={host} onChange={(e) => setHost(e.target.value)} placeholder="IP / host (e.g. 192.168.1.10)" />
             <input className="port" value={port} onChange={(e) => setPort(e.target.value)} placeholder="port" />
           </div>
-          <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="token (optional)" />
+          <div className="token-row">
+            <input
+              type={tokenVisible ? "text" : "password"}
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="token"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button type="button" className="token-toggle" onClick={() => setTokenVisible((visible) => !visible)}>
+              {tokenVisible ? "Hide" : "Show"}
+            </button>
+          </div>
           <button type="submit" disabled={busy}>
             {busy ? "Connecting…" : "Connect"}
           </button>
@@ -407,7 +512,11 @@ export default function App() {
         <button className={follow ? "follow on" : "follow"} onClick={() => setFollow((f) => !f)} title="Follow IDA's current address">
           {follow ? "● Following" : "Follow"}
         </button>
-        <button className={drive ? "follow on" : "follow"} onClick={() => setDrive((d) => !d)} title="Send your clicks to IDA and enable rename/comment">
+        <button
+          className={drive ? "follow on" : "follow"}
+          onClick={() => setDrive((d) => !d)}
+          title={info.allow_write ? "Send clicks to IDA and enable write-back" : "Send clicks to IDA (write-back is disabled on the server)"}
+        >
           {drive ? "● Driving" : "Drive"}
         </button>
         <button onClick={disconnect}>Disconnect</button>
@@ -449,7 +558,7 @@ export default function App() {
             {(tab === "disasm" || tab === "graph" || tab === "pseudo") && selected && (
               <span className="dim mono">
                 {selected.name} @ {toHex(selected.ea)}
-                {drive && (
+                {drive && info.allow_write && (
                   <button className="edit" onClick={renameFunction} title="Rename function">
                     ✎
                   </button>
@@ -475,9 +584,9 @@ export default function App() {
                       onAnimationEnd={flashing ? () => setHighlightEa(null) : undefined}
                     >
                       <span
-                        className={`dim ${drive ? "addr-edit" : ""}`}
-                        onClick={drive ? () => setCommentAt(line.ea) : undefined}
-                        title={drive ? "Add / edit comment" : undefined}
+                        className={`dim ${drive && info.allow_write ? "addr-edit" : ""}`}
+                        onClick={drive && info.allow_write ? () => setCommentAt(line.ea) : undefined}
+                        title={drive && info.allow_write ? "Add / edit comment" : undefined}
                       >
                         {toHex(line.ea)}
                       </span>{" "}
@@ -504,7 +613,7 @@ export default function App() {
               {pseudo ? (
                 pseudo.lines.map((line, i) => (
                   <div className="codeline" key={i}>
-                    {renderTokens(line.tokens, navigateToAddress, drive ? renameLvar : undefined)}
+                    {renderTokens(line.tokens, navigateToAddress, drive && info.allow_write ? renameLvar : undefined)}
                   </div>
                 ))
               ) : (
@@ -543,12 +652,12 @@ export default function App() {
               <DataTable
                 columns={["Address", "Length", "String"]}
                 template="15ch 7ch 1fr"
-                rows={visibleStrings.map((s) => [toHex(s.ea), String(s.length), s.text])}
-                addresses={visibleStrings.map((s) => s.ea)}
+                items={strings === null ? null : visibleStrings}
+                renderRow={(item) => [toHex(item.ea), String(item.length), item.text]}
+                getAddress={(item) => item.ea}
                 onNavigate={showStringXrefs}
                 onActivate={goToHexAt}
-                selectedRow={strXrefs ? visibleStrings.findIndex((s) => s.ea === strXrefs.ea) : undefined}
-                loading={strings === null}
+                selectedAddress={strXrefs?.ea}
               />
               {strXrefs && (
                 <div className="xrefs">
@@ -572,48 +681,48 @@ export default function App() {
             <DataTable
               columns={["Address", "Name"]}
               template="15ch 1fr"
-              rows={(names ?? []).map((n) => [toHex(n.ea), n.name])}
-              addresses={(names ?? []).map((n) => n.ea)}
+              items={names}
+              renderRow={(item) => [toHex(item.ea), item.name]}
+              getAddress={(item) => item.ea}
               onNavigate={navigateToAddress}
-              loading={names === null}
             />
           )}
           {tab === "imports" && (
             <DataTable
               columns={["Address", "Module", "Name", "Ordinal"]}
               template="15ch 12ch 1fr 7ch"
-              rows={(imports ?? []).map((m) => [toHex(m.ea), m.module, m.name || "(ordinal)", m.ordinal ? String(m.ordinal) : ""])}
-              addresses={(imports ?? []).map((m) => m.ea)}
+              items={imports}
+              renderRow={(item) => [toHex(item.ea), item.module, item.name || "(ordinal)", item.ordinal ? String(item.ordinal) : ""]}
+              getAddress={(item) => item.ea}
               onNavigate={navigateToAddress}
-              loading={imports === null}
             />
           )}
           {tab === "exports" && (
             <DataTable
               columns={["Address", "Ordinal", "Name"]}
               template="15ch 7ch 1fr"
-              rows={(exports ?? []).map((x) => [toHex(x.ea), String(x.ordinal), x.name])}
-              addresses={(exports ?? []).map((x) => x.ea)}
+              items={exports}
+              renderRow={(item) => [toHex(item.ea), String(item.ordinal), item.name]}
+              getAddress={(item) => item.ea}
               onNavigate={navigateToAddress}
-              loading={exports === null}
             />
           )}
           {tab === "segments" && (
             <DataTable
               columns={["Name", "Start", "End", "Class", "Perm"]}
               template="1fr 15ch 15ch 9ch 6ch"
-              rows={(segments ?? []).map((s) => [s.name, toHex(s.start), toHex(s.end), s.class, String(s.perm)])}
-              addresses={(segments ?? []).map((s) => s.start)}
+              items={segments}
+              renderRow={(item) => [item.name, toHex(item.start), toHex(item.end), item.class, String(item.perm)]}
+              getAddress={(item) => item.start}
               onNavigate={navigateToAddress}
-              loading={segments === null}
             />
           )}
           {tab === "types" && (
             <DataTable
               columns={["Ordinal", "Name", "Declaration"]}
               template="7ch 1fr 2fr"
-              rows={(localTypes ?? []).map((t) => [String(t.ordinal), t.name, t.decl])}
-              loading={localTypes === null}
+              items={localTypes}
+              renderRow={(item) => [String(item.ordinal), item.name, item.decl]}
             />
           )}
 
@@ -656,18 +765,18 @@ function HexView({ data }: { data: HexResult }) {
   return <div className="view mono">{rows}</div>;
 }
 
-function DataTable(props: {
+function DataTable<T>(props: {
   columns: string[];
   template: string;
-  rows: string[][];
-  addresses?: Ea[];
+  items: T[] | null;
+  renderRow: (item: T) => string[];
+  getAddress?: (item: T) => Ea;
   onNavigate?: (addr: Ea) => void;
   onActivate?: (addr: Ea) => void;
-  selectedRow?: number;
-  loading: boolean;
+  selectedAddress?: Ea;
 }) {
-  if (props.loading) return <div className="view dim">Loading...</div>;
-  const interactive = props.addresses && (props.onNavigate || props.onActivate);
+  if (props.items === null) return <div className="view dim">Loading...</div>;
+  const interactive = props.getAddress && (props.onNavigate || props.onActivate);
   return (
     <div className="dtable mono">
       <div className="dthead" style={{ gridTemplateColumns: props.template }}>
@@ -677,14 +786,15 @@ function DataTable(props: {
       </div>
       <VirtualList
         className="dtbody"
-        items={props.rows}
+        items={props.items}
         rowHeight={24}
-        renderRow={(row, i) => {
-          const addr = props.addresses?.[i];
+        renderRow={(item, i) => {
+          const row = props.renderRow(item);
+          const addr = props.getAddress?.(item);
           return (
             <div
-              key={i}
-              className={`dtrow ${interactive ? "clickable" : ""} ${props.selectedRow === i ? "active" : ""}`}
+              key={addr ?? i}
+              className={`dtrow ${interactive ? "clickable" : ""} ${props.selectedAddress === addr ? "active" : ""}`}
               style={{ gridTemplateColumns: props.template }}
               onClick={() => addr !== undefined && props.onNavigate?.(addr)}
               onDoubleClick={() => addr !== undefined && props.onActivate?.(addr)}

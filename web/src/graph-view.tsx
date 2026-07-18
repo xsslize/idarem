@@ -21,7 +21,12 @@ interface Layout {
   nodes: Map<number, Placed>;
   minX: number;
   minY: number;
+  maxX: number;
+  maxY: number;
 }
+
+const MAX_RENDERED_BLOCKS = 750;
+const MAX_PAN = 100000;
 
 const EDGE_COLOR: Record<string, string> = {
   true: "#5fae5f", // taken conditional branch — green, like IDA
@@ -95,7 +100,13 @@ function layout(graph: Graph): Layout {
     y += rowHeight + GAP_Y;
   }
 
-  return { nodes, minX, minY: 0 };
+  let maxX = 0;
+  let maxY = 0;
+  for (const node of nodes.values()) {
+    maxX = Math.max(maxX, node.x + node.w);
+    maxY = Math.max(maxY, node.y + node.h);
+  }
+  return { nodes, minX, minY: 0, maxX, maxY };
 }
 
 // Spread several edges that share an endpoint so they don't stack on one line.
@@ -145,15 +156,31 @@ function renderTspans(tokens: Token[], onNavigate: (addr: string) => void): Reac
 }
 
 export function GraphView({ graph, onNavigate }: { graph: Graph; onNavigate: (addr: string) => void }) {
-  const { nodes, minX, minY } = useMemo(() => layout(graph), [graph]);
+  const { nodes, minX, minY, maxX, maxY } = useMemo(() => layout(graph), [graph]);
   const [view, setView] = useState(() => ({ x: 24 - minX, y: 24 - minY, scale: 1 }));
   const svgRef = useRef<SVGSVGElement>(null);
   const drag = useRef<{ id: number; x: number; y: number; vx: number; vy: number } | null>(null);
 
-  // Re-center when a different function's graph loads.
+  function fitGraph() {
+    const element = svgRef.current;
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
+    const scale = Math.min(1.5, Math.max(0.15, Math.min((rect.width - 48) / width, (rect.height - 48) / height)));
+    setView({
+      x: (rect.width - width * scale) / 2 - minX * scale,
+      y: 24 - minY * scale,
+      scale,
+    });
+  }
+
   useEffect(() => {
-    setView({ x: 24 - minX, y: 24 - minY, scale: 1 });
-  }, [graph, minX, minY]);
+    const frame = requestAnimationFrame(fitGraph);
+    return () => cancelAnimationFrame(frame);
+    // fitGraph intentionally follows the freshly-computed graph bounds.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph, minX, minY, maxX, maxY]);
 
   // Zoom toward (px, py) in element-local coordinates, keeping that point fixed.
   function zoom(factor: number, px: number, py: number) {
@@ -168,6 +195,7 @@ export function GraphView({ graph, onNavigate }: { graph: Graph; onNavigate: (ad
   }
 
   function onWheel(e: WheelEvent) {
+    e.preventDefault();
     const rect = e.currentTarget.getBoundingClientRect();
     zoom(e.deltaY < 0 ? 1.1 : 1 / 1.1, e.clientX - rect.left, e.clientY - rect.top);
   }
@@ -182,6 +210,7 @@ export function GraphView({ graph, onNavigate }: { graph: Graph; onNavigate: (ad
   // Pointer Events cover mouse and touch with one path; pointer capture keeps the
   // drag tracking even past the graph's edge and guarantees we catch the release.
   function onPointerDown(e: PointerEvent<SVGSVGElement>) {
+    if ((e.target as Element).closest(".ref")) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
@@ -190,11 +219,19 @@ export function GraphView({ graph, onNavigate }: { graph: Graph; onNavigate: (ad
   function onPointerMove(e: PointerEvent<SVGSVGElement>) {
     const d = drag.current;
     if (!d || d.id !== e.pointerId) return;
-    setView((v) => ({ ...v, x: d.vx + (e.clientX - d.x), y: d.vy + (e.clientY - d.y) }));
+    setView((v) => ({
+      ...v,
+      x: Math.max(-MAX_PAN, Math.min(MAX_PAN, d.vx + (e.clientX - d.x))),
+      y: Math.max(-MAX_PAN, Math.min(MAX_PAN, d.vy + (e.clientY - d.y))),
+    }));
   }
 
   function onPointerUp(e: PointerEvent<SVGSVGElement>) {
     if (drag.current?.id === e.pointerId) drag.current = null;
+  }
+
+  if (graph.blocks.length > MAX_RENDERED_BLOCKS) {
+    return <div className="view dim">Graph has {graph.blocks.length} blocks; the safe browser limit is {MAX_RENDERED_BLOCKS}.</div>;
   }
 
   const placed = [...nodes.values()];
@@ -216,6 +253,7 @@ export function GraphView({ graph, onNavigate }: { graph: Graph; onNavigate: (ad
       <div className="graphzoom">
         <button onClick={() => zoomButton(1.25)} aria-label="Zoom in">+</button>
         <button onClick={() => zoomButton(1 / 1.25)} aria-label="Zoom out">−</button>
+        <button onClick={fitGraph} aria-label="Fit graph" title="Fit graph">Fit</button>
       </div>
       <svg
         ref={svgRef}
@@ -225,6 +263,9 @@ export function GraphView({ graph, onNavigate }: { graph: Graph; onNavigate: (ad
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
+        onLostPointerCapture={() => {
+          drag.current = null;
+        }}
       >
         <defs>
           {Object.entries(EDGE_COLOR).map(([kind, color]) => (

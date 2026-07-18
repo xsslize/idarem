@@ -28,6 +28,11 @@ export function VirtualList<T>({
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    setScrollTop(0);
+    if (ref.current) ref.current.scrollTop = 0;
+  }, [items]);
+
   const total = items.length;
   const overscan = 8;
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);

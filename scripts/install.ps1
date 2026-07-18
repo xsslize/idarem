@@ -26,8 +26,10 @@ if (-not (Test-Path $PluginFile)) { throw "Plugin not found at $PluginFile" }
 Write-Host "[1/3] Building the web client..." -ForegroundColor Cyan
 Push-Location $WebDir
 try {
-    if (-not (Test-Path "node_modules")) { npm install }
+    npm ci
+    if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE" }
     npm run build
+    if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
 }
 finally { Pop-Location }
 

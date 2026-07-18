@@ -79,19 +79,25 @@ Admin console → **Access controls**. Add a top-level `nodeAttrs` block grantin
 
 Save.
 
-### 3. Set a real auth token
+### 3. Configure the auth token
 
 Funnel makes the server reachable by **anyone on the internet who has the URL**, so a
-token is mandatory. In `plugin/idarem.py`, set `AUTH_TOKEN` to a strong secret:
+token is mandatory. `idarem` generates a strong session token automatically and
+prints it in IDA's Output window. For a stable token across restarts, generate one:
 
 ```sh
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-Paste the result into `AUTH_TOKEN` and reload the plugin. (The repo ships a
-placeholder on purpose — never serve with it.) If you also enable write-back
-(`ALLOW_WRITE = True`, the default), remember the token now also guards renames and
-comments to your database — set `ALLOW_WRITE = False` if you want remote viewing only.
+Store the result in the per-user `IDAREM_AUTH_TOKEN` environment variable, then
+restart IDA:
+
+```powershell
+[Environment]::SetEnvironmentVariable("IDAREM_AUTH_TOKEN", "paste-token-here", "User")
+```
+
+Write-back is disabled by default. Enable it only when needed with
+`IDAREM_ALLOW_WRITE=1`; the token then also guards renames and comments.
 
 ### 4. Start the Funnel
 
@@ -136,8 +142,11 @@ If the viewing device can run Tailscale, you don't need Funnel at all — it's m
 private (nothing is published to the internet):
 
 1. Install Tailscale on both machines and log into the same tailnet.
-2. Find the home PC's tailnet IP (`100.x.y.z`) — `tailscale ip -4`, or the admin console.
-3. On the other device, open `http://100.x.y.z:8765` and connect.
+2. Set `IDAREM_HOST=0.0.0.0` on the home PC and restart IDA. The safe default
+   `127.0.0.1` accepts only local connections and is sufficient for Funnel, but not
+   for direct tailnet-IP access.
+3. Find the home PC's tailnet IP (`100.x.y.z`) — `tailscale ip -4`, or the admin console.
+4. On the other device, open `http://100.x.y.z:8765` and connect.
 
 This works over the internet, not just the LAN, because Tailscale builds a direct
 encrypted tunnel between the two devices. A token is still recommended.
@@ -150,7 +159,7 @@ encrypted tunnel between the two devices. A token is still recommended.
 answered on `127.0.0.1:8765`. The plugin server isn't running:
 
 - Make sure **IDA is open** with a database and the plugin is started
-  (`Ctrl-Alt-R`; the Output window shows `[idarem] serving on http://0.0.0.0:8765`).
+  (`Ctrl-Alt-R`; by default the Output window shows `[idarem] serving on http://127.0.0.1:8765`).
 - Confirm `http://localhost:8765` works locally on the IDA machine.
 - Funnel and the plugin are **two separate processes** — both must be running at the
   same time. Closing IDA brings the 502 back.
@@ -159,17 +168,16 @@ answered on `127.0.0.1:8765`. The plugin server isn't running:
 didn't find the built web client. Run it from the repo (so it auto-detects `web/dist`)
 or set `WEB_ROOT` / `IDAREM_WEB_ROOT` — see the main README.
 
-**`401 unauthorized`.** The token in the connection page doesn't match `AUTH_TOKEN`
-in the plugin. They must be identical, and the plugin must have been reloaded after
-changing it.
+**`401 unauthorized`.** The token in the connection page doesn't match the generated
+session token or `IDAREM_AUTH_TOKEN`. Check IDA's Output window and restart IDA after
+changing a persistent environment variable.
 
 ---
 
 ## Security checklist
 
-- ✅ A strong, unique `AUTH_TOKEN` (never the repo placeholder) whenever the server
-  is reachable beyond `localhost`.
-- ✅ `ALLOW_WRITE = False` if you only want to read the database remotely.
+- ✅ Use the generated session token or a strong, unique `IDAREM_AUTH_TOKEN`.
+- ✅ Leave `IDAREM_ALLOW_WRITE` unset if you only want to read the database remotely.
 - ✅ Prefer **private** tailnet access (Serve / tailnet IP) over **Funnel** when the
   viewing device can run Tailscale — Funnel is public to the whole internet, gated
   only by your token.

@@ -4,6 +4,22 @@
   height: 100%;
 }
 
+.fatal-error {
+  max-width: 680px;
+  margin: 12vh auto;
+  padding: 24px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.fatal-error pre {
+  overflow: auto;
+  white-space: pre-wrap;
+  color: var(--error-fg);
+}
+
 .dim {
   color: var(--dim);
 }
@@ -116,6 +132,20 @@
 .connect-row {
   display: flex;
   gap: 10px;
+}
+
+.token-row {
+  display: flex;
+  gap: 8px;
+}
+
+.connect-card .token-toggle {
+  flex: none;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--btn-bg);
+  color: var(--text);
+  border: 1px solid var(--line);
 }
 
 .connect-card input {
