@@ -19,13 +19,13 @@ IDA runs on a workstation. When you're away from it, you usually can't review an
 
 ```
 [ Workstation: IDA + Plugin ]  ──HTTP──▶  [ Tunnel ]  ──▶  [ Laptop: Browser ]
-   Flask server in a thread                (Cloudflare /        React client
+   Waitress + Flask in a thread            (Cloudflare /        React client
    + ida_kernwin.execute_sync               ngrok / Tailscale)
 ```
 
 ## How it works
 
-- **`plugin/idarem.py`** — an IDA plugin that starts a Flask server in a daemon thread and answers REST queries.
+- **`plugin/idarem.py`** — an IDA plugin that starts a bounded Waitress/Flask server in a daemon thread and answers REST queries.
 - The IDA API is **not thread-safe**, so every database call is marshaled onto IDA's main thread with `ida_kernwin.execute_sync(...)`: `MFF_READ` for queries and `MFF_WRITE` for database changes.
 - Endpoints: `/api/info`, `/api/functions`, `/api/disasm/<ea>`, `/api/graph/<ea>`, `/api/pseudocode/<ea>`, `/api/xrefs/<ea>`, `/api/hex`, `/api/strings`, `/api/names`, `/api/imports`, `/api/exports`, `/api/segments`, `/api/local-types`, `/api/events` (SSE).
 - **Live follow** — a `UI_Hooks` watcher pushes IDA's current screen address *and active window* over Server-Sent Events; toggle **Follow IDA** in the client and the web jumps to the function you're on and switches to the matching tab (disassembly ↔ pseudocode ↔ strings ↔ hex …) as you move around IDA.
@@ -81,7 +81,7 @@ installed** — any folder or drive. Re-run `install.ps1` only if you move the r
 ### Manual (any OS)
 
 1. `python -m pip install -r plugin/requirements.txt` into IDA's Python.
-2. Build the UI: `cd web && npm install && npm run build`.
+2. Build the UI: `cd web && npm ci && npm run build`.
 3. Load `plugin/idarem.py` in IDA — run it from the repo (*File → Script file*) and it auto-detects `web/dist`; or copy it into a `plugins/` folder and set `WEB_ROOT` (or the `IDAREM_WEB_ROOT` env var) to the `web/dist` path.
 4. `Ctrl-Alt-R` (or **Edit → Plugins → idarem**) starts the server on `http://localhost:8765`.
 
@@ -112,7 +112,7 @@ raw HTTP port.
 
 ## Tech
 
-IDAPython 3 (IDA 9.x) · Flask · Server-Sent Events · React · TypeScript · Vite
+IDAPython 3 (IDA 9.x) · Waitress / Flask · Server-Sent Events · React · TypeScript · Vite
 
 ## Checks
 

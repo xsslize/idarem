@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ApiClient,
+  HttpError,
+  findFunctionByAddress,
   toHex,
   eaAdd,
   type Ea,
@@ -81,6 +83,7 @@ export default function App() {
   const [graph, setGraph] = useState<Graph | null>(null);
   const [pseudo, setPseudo] = useState<Pseudocode | null>(null);
   const [xrefs, setXrefs] = useState<Xref[]>([]);
+  const [xrefsTruncated, setXrefsTruncated] = useState(false);
 
   const [strings, setStrings] = useState<StringItem[] | null>(null);
   const [imports, setImports] = useState<ImportItem[] | null>(null);
@@ -91,9 +94,10 @@ export default function App() {
   const [hexAddr, setHexAddr] = useState("");
   const [hexData, setHexData] = useState<HexResult | null>(null);
   const [stringFilter, setStringFilter] = useState("");
-  const [strXrefs, setStrXrefs] = useState<{ ea: Ea; items: Xref[] } | null>(null);
+  const [strXrefs, setStrXrefs] = useState<{ ea: Ea; items: Xref[]; truncated: boolean } | null>(null);
   const [highlightEa, setHighlightEa] = useState<Ea | null>(null);
   const [follow, setFollow] = useState(false);
+  const [followStatus, setFollowStatus] = useState<"idle" | "connected" | "reconnecting">("idle");
   const [drive, setDrive] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -108,6 +112,11 @@ export default function App() {
   const clientRef = useRef<ApiClient | null>(null);
   selectedRef.current = selected;
   clientRef.current = client;
+
+  const functionsByAddress = useMemo(
+    () => [...functions].sort((left, right) => (BigInt(left.ea) < BigInt(right.ea) ? -1 : BigInt(left.ea) > BigInt(right.ea) ? 1 : 0)),
+    [functions],
+  );
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme; // theme the whole document
@@ -130,6 +139,7 @@ export default function App() {
       setGraph(null);
       setPseudo(null);
       setXrefs([]);
+      setXrefsTruncated(false);
       setStrings(null);
       setImports(null);
       setExports(null);
@@ -159,6 +169,30 @@ export default function App() {
     clientRef.current = null;
     setClient(null);
     setInfo(null);
+    setFunctions([]);
+    setSelected(null);
+    setDisasm(null);
+    setGraph(null);
+    setPseudo(null);
+    setXrefs([]);
+    setXrefsTruncated(false);
+    setStrings(null);
+    setImports(null);
+    setExports(null);
+    setSegments(null);
+    setNames(null);
+    setLocalTypes(null);
+    setHexData(null);
+    setStrXrefs(null);
+    setHighlightEa(null);
+    setFollow(false);
+    setFollowStatus("idle");
+    setDrive(false);
+    setNavOpen(false);
+    setPaletteOpen(false);
+    setToken("");
+    setFilter("");
+    setStringFilter("");
     setError("");
   }
 
@@ -174,11 +208,13 @@ export default function App() {
     setGraph(null);
     setPseudo(null);
     setXrefs([]);
+    setXrefsTruncated(false);
     try {
       const [d, x] = await Promise.all([client.disasm(fn.ea, controller.signal), client.xrefs(fn.ea, controller.signal)]);
       if (controller.signal.aborted || generation !== selectionGeneration.current) return;
       setDisasm(d);
-      setXrefs(x);
+      setXrefs(x.items);
+      setXrefsTruncated(x.truncated);
       // Graph and pseudocode are loaded only for the tab actually in view —
       // decompilation in particular is too expensive to run on every click.
       if (tab === "graph") {
@@ -195,19 +231,7 @@ export default function App() {
   }
 
   function findFunction(addr: Ea): FunctionEntry | undefined {
-    let a: bigint;
-    try {
-      a = BigInt(addr);
-    } catch {
-      return undefined;
-    }
-    return (
-      functions.find((f) => BigInt(f.ea) === a) ??
-      functions.find((f) => {
-        const start = BigInt(f.ea);
-        return a >= start && a < start + BigInt(f.size);
-      })
-    );
+    return findFunctionByAddress(functionsByAddress, addr);
   }
 
   function navigateToAddress(addr: Ea, switchTab = true) {
@@ -240,19 +264,35 @@ export default function App() {
 
   // "Follow IDA": mirror IDA's current address and active view over SSE.
   useEffect(() => {
-    if (!follow || !client) return;
+    if (!follow || !client) {
+      setFollowStatus("idle");
+      return;
+    }
     const controller = new AbortController();
     const receive = async () => {
+      let retryDelay = 1500;
       while (!controller.signal.aborted) {
         try {
           await client.events((msg) => {
+            setFollowStatus("connected");
+            retryDelay = 1500;
             if (msg.type === "screen_ea" && msg.ea) navRef.current(msg.ea, false);
             else if (msg.type === "view" && msg.view && (TABS as string[]).includes(msg.view)) showTabRef.current(msg.view as Tab);
           }, controller.signal);
-        } catch {
+          if (!controller.signal.aborted) setFollowStatus("reconnecting");
+        } catch (eventError) {
           if (controller.signal.aborted) break;
+          if (eventError instanceof HttpError && (eventError.status === 401 || eventError.status === 403)) {
+            setFollow(false);
+            setError("Follow IDA stopped: the token is no longer accepted. Reconnect with the current token.");
+            break;
+          }
+          setFollowStatus("reconnecting");
         }
-        if (!controller.signal.aborted) await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        if (!controller.signal.aborted) {
+          await new Promise((resolve) => window.setTimeout(resolve, retryDelay));
+          retryDelay = Math.min(retryDelay * 2, 30_000);
+        }
       }
     };
     void receive();
@@ -306,7 +346,9 @@ export default function App() {
     const generation = ++stringXrefGeneration.current;
     try {
       const items = await client.xrefs(ea);
-      if (clientRef.current === activeClient && stringXrefGeneration.current === generation) setStrXrefs({ ea, items });
+      if (clientRef.current === activeClient && stringXrefGeneration.current === generation) {
+        setStrXrefs({ ea, items: items.items, truncated: items.truncated });
+      }
     } catch (e) {
       if (clientRef.current === activeClient && stringXrefGeneration.current === generation) setError(`Load failed: ${(e as Error).message}`);
     }
@@ -321,7 +363,14 @@ export default function App() {
 
   // Web -> IDA: when "Drive IDA" is on, send the address for IDA to jump to.
   function driveTo(ea: Ea) {
-    if (drive && client) client.goto(ea).catch(() => {});
+    if (drive && client) {
+      client
+        .goto(ea)
+        .then((result) => {
+          if (!result.ok) setError(`IDA could not jump to ${toHex(ea)}.`);
+        })
+        .catch((driveError) => setError(`Drive IDA failed: ${(driveError as Error).message}`));
+    }
   }
 
   async function renameFunction() {
@@ -452,6 +501,11 @@ export default function App() {
     return needle ? list.filter((s) => s.text.toLowerCase().includes(needle) || toHex(s.ea).toLowerCase().includes(needle)) : list;
   }, [strings, stringFilter]);
 
+  const highlightedDisassemblyIndex = useMemo(
+    () => (highlightEa && disasm ? disasm.lines.findIndex((line) => line.ea === highlightEa) : -1),
+    [disasm, highlightEa],
+  );
+
   // Connection screen — shown until a session is established.
   if (!info) {
     return (
@@ -510,7 +564,7 @@ export default function App() {
           <option value="light">Light</option>
         </select>
         <button className={follow ? "follow on" : "follow"} onClick={() => setFollow((f) => !f)} title="Follow IDA's current address">
-          {follow ? "● Following" : "Follow"}
+          {follow ? (followStatus === "reconnecting" ? "○ Reconnecting" : "● Following") : "Follow"}
         </button>
         <button
           className={drive ? "follow on" : "follow"}
@@ -572,9 +626,13 @@ export default function App() {
           )}
 
           {tab === "disasm" && selected && (
-            <div className="view mono">
-              {disasm ? (
-                disasm.lines.map((line) => {
+            disasm ? (
+              <VirtualList
+                className="view mono code-list"
+                items={disasm.lines}
+                rowHeight={24}
+                scrollToIndex={highlightedDisassemblyIndex >= 0 ? highlightedDisassemblyIndex : undefined}
+                renderRow={(line) => {
                   const flashing = line.ea === highlightEa;
                   return (
                     <div
@@ -593,11 +651,11 @@ export default function App() {
                       {renderTokens(line.tokens, navigateToAddress)}
                     </div>
                   );
-                })
-              ) : (
-                <div className="dim">Loading...</div>
-              )}
-            </div>
+                }}
+              />
+            ) : (
+              <div className="view dim">Loading...</div>
+            )
           )}
 
           {tab === "graph" &&
@@ -609,17 +667,20 @@ export default function App() {
             ))}
 
           {tab === "pseudo" && selected && (
-            <div className="view mono">
-              {pseudo ? (
-                pseudo.lines.map((line, i) => (
-                  <div className="codeline" key={i}>
+            pseudo ? (
+              <VirtualList
+                className="view mono code-list"
+                items={pseudo.lines}
+                rowHeight={24}
+                renderRow={(line, index) => (
+                  <div className="codeline" key={index}>
                     {renderTokens(line.tokens, navigateToAddress, drive && info.allow_write ? renameLvar : undefined)}
                   </div>
-                ))
-              ) : (
-                <div className="dim">Loading...</div>
-              )}
-            </div>
+                )}
+              />
+            ) : (
+              <div className="view dim">Loading...</div>
+            )
           )}
 
           {tab === "hex" && (
@@ -667,12 +728,18 @@ export default function App() {
                       open in Hex
                     </span>
                   </div>
+                  {strXrefs.truncated && <div className="dim">Showing the first {strXrefs.items.length} references.</div>}
                   {strXrefs.items.length === 0 && <div className="dim">no cross-references</div>}
-                  {strXrefs.items.map((x, i) => (
-                    <div className="xref mono ref" key={i} onClick={() => navigateToAddress(x.frm)}>
-                      <span className="dim">{toHex(x.frm)}</span> {x.name || "—"}
-                    </div>
-                  ))}
+                  <VirtualList
+                    className="xref-list"
+                    items={strXrefs.items}
+                    rowHeight={24}
+                    renderRow={(x, index) => (
+                      <div className="xref mono ref" key={`${x.frm}-${index}`} onClick={() => navigateToAddress(x.frm)}>
+                        <span className="dim">{toHex(x.frm)}</span> {x.name || "—"}
+                      </div>
+                    )}
+                  />
                 </div>
               )}
             </>
@@ -729,11 +796,17 @@ export default function App() {
           {(tab === "disasm" || tab === "pseudo") && selected && xrefs.length > 0 && (
             <div className="xrefs">
               <div className="dim">Cross-references ({xrefs.length})</div>
-              {xrefs.map((x, i) => (
-                <div className="xref mono ref" key={i} onClick={() => navigateToAddress(x.frm)}>
-                  <span className="dim">{toHex(x.frm)}</span> {x.name || "—"}
-                </div>
-              ))}
+              {xrefsTruncated && <div className="dim">Showing the first {xrefs.length} references.</div>}
+              <VirtualList
+                className="xref-list"
+                items={xrefs}
+                rowHeight={24}
+                renderRow={(x, index) => (
+                  <div className="xref mono ref" key={`${x.frm}-${index}`} onClick={() => navigateToAddress(x.frm)}>
+                    <span className="dim">{toHex(x.frm)}</span> {x.name || "—"}
+                  </div>
+                )}
+              />
             </div>
           )}
         </main>

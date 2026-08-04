@@ -18,6 +18,7 @@ import ida_segment
 import ida_typeinf
 import ida_gdl
 import ida_xref
+import ida_strlist
 import idautils
 
 try:
@@ -27,10 +28,23 @@ except Exception:
     _HAS_HEXRAYS = False
 
 from flask import Flask, jsonify, request, Response, send_from_directory, g
-from werkzeug.serving import make_server
+from waitress.server import create_server
 
 HOST = os.environ.get("IDAREM_HOST", "127.0.0.1").strip() or "127.0.0.1"
-PORT = int(os.environ.get("IDAREM_PORT", "8765"))
+
+def _read_port():
+    value = os.environ.get("IDAREM_PORT", "8765").strip()
+    try:
+        port = int(value)
+    except ValueError:
+        print(f"[idarem] invalid IDAREM_PORT={value!r}; using 8765")
+        return 8765
+    if not 1 <= port <= 65535:
+        print(f"[idarem] IDAREM_PORT must be between 1 and 65535; using 8765")
+        return 8765
+    return port
+
+PORT = _read_port()
 AUTH_TOKEN = os.environ.get("IDAREM_AUTH_TOKEN", "").strip()
 WEB_ROOT = ""
 ALLOW_WRITE = os.environ.get("IDAREM_ALLOW_WRITE", "").strip().lower() in ("1", "true", "yes", "on")
@@ -235,6 +249,9 @@ def hexea(ea):
 class ApiError(ValueError):
     pass
 
+class ClientDisconnected(RuntimeError):
+    pass
+
 def parse_ea(value):
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise ApiError("address must be a hexadecimal string")
@@ -267,6 +284,7 @@ _event_lock = threading.Lock()
 _server_stop_event = threading.Event()
 _MAX_EVENT_SUBSCRIBERS = 8
 _EVENT_QUEUE_SIZE = 16
+_MAX_XREFS = 5000
 
 def publish_event(event):
     data = json.dumps(event)
@@ -460,7 +478,11 @@ def query_pseudocode(ea):
 
 def query_xrefs(ea):
     references = []
+    truncated = False
     for xref in idautils.XrefsTo(ea):
+        if len(references) >= _MAX_XREFS:
+            truncated = True
+            break
         references.append(
             {
                 "frm": hexea(xref.frm),
@@ -468,7 +490,7 @@ def query_xrefs(ea):
                 "is_call": xref.type in (ida_xref.fl_CF, ida_xref.fl_CN),
             }
         )
-    return references
+    return {"items": references, "truncated": truncated}
 
 def query_strings():
     items = []
@@ -561,28 +583,61 @@ def query_local_types():
 _search_index = None
 _search_index_built_at = 0.0
 _search_index_lock = threading.Lock()
+_SEARCH_INDEX_TTL = 300
+_SEARCH_INDEX_CHUNK_SIZE = 512
 
-def query_search_index():
-    index = {"function": [], "string": [], "name": []}
-    for start_ea in idautils.Functions():
-        name = ida_funcs.get_func_name(start_ea) or ""
-        index["function"].append((start_ea, name, name.lower()))
-    for string_item in idautils.Strings():
-        text = str(string_item)[:120]
-        index["string"].append((string_item.ea, text, text.lower()))
-        if len(index["string"]) >= 50000:
-            break
-    for ea, name in idautils.Names():
-        index["name"].append((ea, name, name.lower()))
-        if len(index["name"]) >= 50000:
-            break
-    return index
+def query_search_index_chunk(kind, start):
+    entries = []
+    end = start + _SEARCH_INDEX_CHUNK_SIZE
 
-def get_search_index():
+    if kind == "function":
+        count = min(ida_funcs.get_func_qty(), 100000)
+        for index in range(start, min(end, count)):
+            func = ida_funcs.getn_func(index)
+            if func is None:
+                continue
+            name = ida_funcs.get_func_name(func.start_ea) or ""
+            entries.append((func.start_ea, name, name.lower()))
+    elif kind == "string":
+        count = min(ida_strlist.get_strlist_qty(), 50000)
+        string_info = ida_strlist.string_info_t()
+        for index in range(start, min(end, count)):
+            if not ida_strlist.get_strlist_item(string_info, index):
+                continue
+            contents = ida_bytes.get_strlit_contents(string_info.ea, string_info.length, string_info.type) or b""
+            text = contents.decode("UTF-8", "replace")
+            entries.append((string_info.ea, text[:120], text.lower()))
+    elif kind == "name":
+        count = min(ida_name.get_nlist_size(), 50000)
+        for index in range(start, min(end, count)):
+            ea = ida_name.get_nlist_ea(index)
+            name = ida_name.get_nlist_name(index) or ""
+            entries.append((ea, name, name.lower()))
+    else:
+        raise ApiError("unknown search category")
+
+    next_index = min(end, count)
+    return entries, next_index, next_index >= count
+
+def build_search_index(disconnected=None):
+    result = {"function": [], "string": [], "name": []}
+    for kind in result:
+        start = 0
+        while True:
+            entries, start, done = on_main_thread(lambda kind=kind, start=start: query_search_index_chunk(kind, start))
+            result[kind].extend(entries)
+            if done:
+                break
+            if disconnected is not None and disconnected():
+                raise ClientDisconnected("search client disconnected")
+            time.sleep(0)
+    return result
+
+def get_search_index(disconnected=None):
     global _search_index, _search_index_built_at
     with _search_index_lock:
-        if _search_index is None or time.monotonic() - _search_index_built_at > 30:
-            _search_index = on_main_thread(query_search_index)
+        if _search_index is None or time.monotonic() - _search_index_built_at > _SEARCH_INDEX_TTL:
+            _search_index = build_search_index(disconnected)
             _search_index_built_at = time.monotonic()
         return _search_index
 
@@ -592,7 +647,7 @@ def invalidate_search_index():
         _search_index = None
         _search_index_built_at = 0.0
 
-def search_index(query, limit):
+def search_index(query, limit, disconnected=None):
     query = (query or "").strip()
     if not query:
         return []
@@ -608,18 +663,37 @@ def search_index(query, limit):
     except ApiError:
         pass
 
-    per_category = max(1, (limit - len(results)) // 3)
-    index = get_search_index()
+    remaining = limit - len(results)
+    per_category = max(1, remaining // 3)
+    index = get_search_index(disconnected)
+    selected = set((item["kind"], item["ea"]) for item in results)
     for kind in ("function", "string", "name"):
         count = 0
         for ea, label, normalized in index[kind]:
             if low in normalized:
-                results.append({"kind": kind, "ea": hexea(ea), "label": label})
+                key = (kind, hexea(ea))
+                if key in selected:
+                    continue
+                results.append({"kind": kind, "ea": key[1], "label": label})
+                selected.add(key)
                 count += 1
                 if count >= per_category or len(results) >= limit:
                     break
         if len(results) >= limit:
             break
+
+    if len(results) < limit:
+        for kind in ("function", "string", "name"):
+            for ea, label, normalized in index[kind]:
+                key = (kind, hexea(ea))
+                if low not in normalized or key in selected:
+                    continue
+                results.append({"kind": kind, "ea": key[1], "label": label})
+                selected.add(key)
+                if len(results) >= limit:
+                    break
+            if len(results) >= limit:
+                break
     return results[:limit]
 
 app = Flask(__name__, static_folder=None)
@@ -660,6 +734,11 @@ def add_cors_headers(response):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; "
+        "img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http: https:"
+    )
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     return response
 
 @app.before_request
@@ -686,6 +765,10 @@ def handle_api_error(error):
 @app.errorhandler(413)
 def handle_request_too_large(_error):
     return jsonify({"error": "request body is too large"}), 413
+
+@app.errorhandler(ClientDisconnected)
+def handle_client_disconnected(_error):
+    return Response(status=499)
 
 @app.route("/api/info")
 def route_info():
@@ -753,7 +836,15 @@ def route_search():
         return Response("search rate limit exceeded", status=429, headers={"Retry-After": "1"})
     query = request.args.get("q", "")
     limit = request.args.get("limit", default=60, type=int)
-    return jsonify(search_index(query, limit if limit is not None else 60))
+    checker = request.environ.get("waitress.client_disconnected")
+
+    def disconnected():
+        try:
+            return bool(checker and checker())
+        except Exception:
+            return False
+
+    return jsonify(search_index(query, limit if limit is not None else 60, disconnected))
 
 @app.route("/api/events")
 def route_events():
@@ -883,13 +974,27 @@ def start_server():
             print(f"[idarem] already serving on port {PORT}")
             return True
         try:
-            server = make_server(HOST, PORT, app, threaded=True)
-        except OSError as error:
+            server = create_server(
+                app,
+                host=HOST,
+                port=PORT,
+                threads=16,
+                connection_limit=32,
+                backlog=32,
+                cleanup_interval=5,
+                channel_timeout=45,
+                channel_request_lookahead=1,
+                max_request_header_size=32 * 1024,
+                max_request_body_size=64 * 1024,
+                expose_tracebacks=False,
+                ident="idarem",
+            )
+        except (OSError, ValueError) as error:
             print(f"[idarem] failed to bind {HOST}:{PORT}: {error}")
             return False
         _server = server
         _server_stop_event.clear()
-        _server_thread = threading.Thread(target=server.serve_forever, name="idarem", daemon=True)
+        _server_thread = threading.Thread(target=server.run, name="idarem", daemon=True)
         _server_thread.start()
 
     if _screen_hooks is None:
@@ -908,11 +1013,11 @@ def stop_server():
     with _server_lock:
         server = _server
         thread = _server_thread
-        _server = None
-        _server_thread = None
     if server is None:
         print("[idarem] server is not running")
         return False
+
+    stopped = True
     _server_stop_event.set()
     with _event_lock:
         for subscriber in list(_event_subscribers):
@@ -920,17 +1025,35 @@ def stop_server():
                 subscriber.put_nowait(None)
             except queue.Full:
                 pass
-    server.shutdown()
-    server.server_close()
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=2)
-    if _screen_hooks is not None:
-        _screen_hooks.unhook()
-        _screen_hooks = None
-    with _event_lock:
-        _event_subscribers.clear()
-    print("[idarem] server stopped")
-    return True
+    try:
+        server.close()
+        for channel in list(getattr(server, "active_channels", {}).values()):
+            channel.close()
+        dispatcher = getattr(server, "task_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.shutdown(cancel_pending=True, timeout=2)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3)
+        if thread is not None and thread.is_alive():
+            print("[idarem] server thread did not stop within the timeout")
+            stopped = False
+    except Exception as error:
+        print(f"[idarem] failed to stop server cleanly: {error}")
+        stopped = False
+    finally:
+        if _screen_hooks is not None:
+            _screen_hooks.unhook()
+            _screen_hooks = None
+        with _event_lock:
+            _event_subscribers.clear()
+        with _server_lock:
+            if stopped and _server is server:
+                _server = None
+                _server_thread = None
+
+    if stopped:
+        print("[idarem] server stopped")
+    return stopped
 
 class IdaRemotePlugin(ida_idaapi.plugin_t):
     flags = 0

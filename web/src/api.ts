@@ -19,6 +19,33 @@ export interface FunctionEntry {
   size: number;
 }
 
+export function findFunctionByAddress(functions: FunctionEntry[], address: Ea): FunctionEntry | undefined {
+  let target: bigint;
+  try {
+    target = BigInt(address);
+  } catch {
+    return undefined;
+  }
+
+  let low = 0;
+  let high = functions.length - 1;
+  let candidate: FunctionEntry | undefined;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const current = functions[middle];
+    const start = BigInt(current.ea);
+    if (start <= target) {
+      candidate = current;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (!candidate) return undefined;
+  const start = BigInt(candidate.ea);
+  return target < start + BigInt(candidate.size) ? candidate : undefined;
+}
+
 // One colored span of a code line: text plus an IDA color category. In
 // pseudocode, `lv` is set to the local-variable name when the token is one.
 export interface Token {
@@ -72,6 +99,11 @@ export interface Xref {
   frm: Ea;
   name: string;
   is_call: boolean;
+}
+
+export interface XrefResult {
+  items: Xref[];
+  truncated: boolean;
 }
 
 export interface StringItem {
@@ -136,6 +168,16 @@ export interface ServerEvent {
   view?: string;
 }
 
+export class HttpError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token: string;
@@ -145,9 +187,9 @@ export class ApiClient {
     this.token = token;
   }
 
-  private async request<T>(path: string, init: RequestInit, signal?: AbortSignal): Promise<T> {
+  private async request<T>(path: string, init: RequestInit, signal?: AbortSignal, timeoutMs = 15_000): Promise<T> {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 15_000);
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
     const abort = () => controller.abort();
     if (signal?.aborted) controller.abort();
     signal?.addEventListener("abort", abort, { once: true });
@@ -155,7 +197,7 @@ export class ApiClient {
       const response = await fetch(`${this.baseUrl}${path}`, { ...init, signal: controller.signal });
       if (!response.ok) {
         const detail = (await response.text()).trim();
-        throw new Error(`${response.status} ${detail || response.statusText}`);
+        throw new HttpError(response.status, `${response.status} ${detail || response.statusText}`);
       }
       return (await response.json()) as T;
     } finally {
@@ -164,10 +206,10 @@ export class ApiClient {
     }
   }
 
-  private async get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  private async get<T>(path: string, signal?: AbortSignal, timeoutMs?: number): Promise<T> {
     const headers: Record<string, string> = {};
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
-    return this.request<T>(path, { headers }, signal);
+    return this.request<T>(path, { headers }, signal, timeoutMs);
   }
 
   private async post<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
@@ -192,7 +234,7 @@ export class ApiClient {
     return this.get<Pseudocode>(`/api/pseudocode/${ea}`, signal);
   }
   xrefs(ea: Ea, signal?: AbortSignal) {
-    return this.get<Xref[]>(`/api/xrefs/${ea}`, signal);
+    return this.get<XrefResult>(`/api/xrefs/${ea}`, signal);
   }
   strings() {
     return this.get<StringItem[]>("/api/strings");
@@ -216,13 +258,13 @@ export class ApiClient {
     return this.get<LocalTypesResult>("/api/local-types");
   }
   search(query: string, limit = 60, signal?: AbortSignal) {
-    return this.get<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}&limit=${limit}`, signal);
+    return this.get<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}&limit=${limit}`, signal, 60_000);
   }
   async events(onEvent: (event: ServerEvent) => void, signal: AbortSignal): Promise<void> {
     const headers: Record<string, string> = { Accept: "text/event-stream" };
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
     const response = await fetch(`${this.baseUrl}/api/events`, { headers, signal, cache: "no-store" });
-    if (!response.ok || !response.body) throw new Error(`${response.status} ${response.statusText}`);
+    if (!response.ok || !response.body) throw new HttpError(response.status, `${response.status} ${response.statusText}`);
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();

@@ -33,6 +33,8 @@ export function CommandPalette({
     const q = query.trim();
     if (!q) {
       setResults([]);
+      setSel(0);
+      setBusy(false);
       return;
     }
     let cancelled = false;
@@ -67,7 +69,7 @@ export function CommandPalette({
     if (e.key === "Escape") onClose();
     else if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSel((s) => Math.min(s + 1, results.length - 1));
+      if (results.length > 0) setSel((s) => Math.min(s + 1, results.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setSel((s) => Math.max(s - 1, 0));

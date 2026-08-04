@@ -520,6 +520,15 @@
   line-height: 1.5;
 }
 
+.xref-list {
+  height: min(220px, 25vh);
+}
+
+.code-list .codeline {
+  height: 24px;
+  line-height: 24px;
+}
+
 /* --- Command palette ----------------------------------------------------- */
 .palette-overlay {
   position: fixed;

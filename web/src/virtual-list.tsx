@@ -8,11 +8,13 @@ export function VirtualList<T>({
   rowHeight,
   className,
   renderRow,
+  scrollToIndex,
 }: {
   items: T[];
   rowHeight: number;
   className?: string;
   renderRow: (item: T, index: number) => ReactNode;
+  scrollToIndex?: number;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -32,6 +34,14 @@ export function VirtualList<T>({
     setScrollTop(0);
     if (ref.current) ref.current.scrollTop = 0;
   }, [items]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || scrollToIndex === undefined || scrollToIndex < 0 || scrollToIndex >= items.length) return;
+    const next = Math.max(0, scrollToIndex * rowHeight - (el.clientHeight - rowHeight) / 2);
+    el.scrollTop = next;
+    setScrollTop(next);
+  }, [items, rowHeight, scrollToIndex]);
 
   const total = items.length;
   const overscan = 8;

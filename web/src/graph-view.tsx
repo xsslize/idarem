@@ -57,6 +57,8 @@ function layout(graph: Graph): Layout {
     });
   }
 
+  if (nodes.size === 0) return { nodes, minX: 0, minY: 0, maxX: 0, maxY: 0 };
+
   const succ = new Map<number, number[]>();
   for (const edge of graph.edges) {
     if (!succ.has(edge.src)) succ.set(edge.src, []);
@@ -232,6 +234,9 @@ export function GraphView({ graph, onNavigate }: { graph: Graph; onNavigate: (ad
 
   if (graph.blocks.length > MAX_RENDERED_BLOCKS) {
     return <div className="view dim">Graph has {graph.blocks.length} blocks; the safe browser limit is {MAX_RENDERED_BLOCKS}.</div>;
+  }
+  if (graph.blocks.length === 0) {
+    return <div className="view dim">IDA returned an empty control-flow graph for this function.</div>;
   }
 
   const placed = [...nodes.values()];
